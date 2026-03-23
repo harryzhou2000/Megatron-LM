@@ -8,13 +8,14 @@ import os
 import pickle
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -43,12 +44,14 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -435,7 +438,9 @@ class TENorm:
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
+    ) -> LayerNormInterface:
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -464,7 +469,7 @@ class TENorm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
-        return instance
+        return cast(LayerNormInterface, instance)
 
 
 class TELinear(te.pytorch.Linear):
@@ -649,6 +654,8 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                    # Mark as NOT tensor parallel since weight is duplicated
+                    setattr(param, "tensor_model_parallel", False)
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -919,10 +926,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1025,10 +1036,14 @@ class TEColumnParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1125,10 +1140,14 @@ class TERowParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1344,21 +1363,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         """Forward."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            if packed_seq_params.local_cp_size is not None:
+                if packed_seq_params.local_cp_size == 1:
+                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                else:
+                    assert (
+                        packed_seq_params.cp_group is not None
+                    ), "cp_group is not set in packed_seq_params for dynamic CP"
+                    self.cp_group = packed_seq_params.cp_group
+                    super().set_context_parallel_group(
+                        self.cp_group,
+                        torch.distributed.get_process_group_ranks(self.cp_group),
+                        TEDotProductAttention.cp_stream,
+                        self.cp_comm_type,
+                    )
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -1550,6 +1568,50 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
+            def normalize_grouped_parameter_keys(
+                self,
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            ):
+                """Make grouped checkpoint keys compatible across parameter layouts."""
+
+                def maybe_remap_param(param_name: str) -> None:
+                    grouped_key = f"{prefix}{param_name}"
+                    indexed_keys = [
+                        f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
+                    ]
+                    has_grouped_key = grouped_key in state_dict
+                    has_any_indexed_key = any(key in state_dict for key in indexed_keys)
+                    has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
+
+                    if getattr(self, "single_grouped_parameter", False):
+                        if has_grouped_key or not has_all_indexed_keys:
+                            return
+                        state_dict[grouped_key] = torch.stack(
+                            [state_dict.pop(key) for key in indexed_keys], dim=0
+                        )
+                    else:
+                        if has_any_indexed_key or not has_grouped_key:
+                            return
+                        split_tensors = self._split_grouped_checkpoint_tensor(
+                            state_dict.pop(grouped_key), grouped_key
+                        )
+                        for gemm_idx, tensor in enumerate(split_tensors):
+                            state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
+
+                maybe_remap_param("weight")
+                if self.use_bias:
+                    maybe_remap_param("bias")
+
+            self._register_load_state_dict_pre_hook(
+                normalize_grouped_parameter_keys, with_module=True
+            )
+
             def merge_extra_states(
                 self,
                 state_dict,
@@ -1639,6 +1701,31 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
+
+        def _split_grouped_checkpoint_tensor(
+            self, tensor: torch.Tensor, checkpoint_key: str
+        ) -> list[torch.Tensor]:
+            """Split grouped checkpoint tensor into one tensor per GEMM."""
+            if hasattr(tensor, "split_into_quantized_tensors") and callable(
+                tensor.split_into_quantized_tensors
+            ):
+                grouped_tensors = getattr(tensor, "quantized_tensors", None)
+                if grouped_tensors is None:
+                    grouped_tensors = tensor.split_into_quantized_tensors()
+                if len(grouped_tensors) != self.num_gemms:
+                    raise RuntimeError(
+                        f"Grouped checkpoint tensor {checkpoint_key} has {len(grouped_tensors)} "
+                        f"groups, expected {self.num_gemms}."
+                    )
+                return list(grouped_tensors)
+            if tensor.ndim > 0 and tensor.shape[0] == self.num_gemms:
+                return list(tensor.unbind(dim=0))
+            if tensor.ndim > 0 and tensor.shape[0] % self.num_gemms == 0:
+                return list(torch.chunk(tensor, self.num_gemms, dim=0))
+            raise RuntimeError(
+                f"Cannot split checkpoint tensor {checkpoint_key} with shape {tuple(tensor.shape)} "
+                f"into {self.num_gemms} GEMM shards."
+            )
 
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""
@@ -1744,6 +1831,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
+            grouped_split_cache = {}
+
+            def get_gemm_tensor(param_name: str, gemm_idx: int) -> torch.Tensor:
+                indexed_name = f"{param_name}{gemm_idx}"
+                if indexed_name in full_state_dict:
+                    return full_state_dict[indexed_name]
+                if param_name not in full_state_dict:
+                    raise KeyError(indexed_name)
+                if param_name not in grouped_split_cache:
+                    grouped_split_cache[param_name] = self._split_grouped_checkpoint_tensor(
+                        full_state_dict[param_name], param_name
+                    )
+                grouped_splits = grouped_split_cache[param_name]
+                return grouped_splits[gemm_idx]
+
             num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
             local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
             ep_axis = len(sharded_offsets)
@@ -1751,11 +1853,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for gemm_idx in range(self.num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
-                    f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                    f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
                 }
                 if self.use_bias:
-                    state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
+                    state_dict[f"{gemm_idx}.bias"] = get_gemm_tensor("bias", gemm_idx)
                 if singleton_local_shards:
                     expert_prefix = f"{global_expert_idx}.{prefix}"
                     new_sharded_offsets = sharded_offsets
@@ -1907,6 +2009,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
@@ -2365,11 +2468,26 @@ try:
         freqs: torch.Tensor,
         cp_size: int = 1,
         cp_rank: int = 0,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.12.0", check_equality=True):
+        if interleaved:
+            assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
+
+        if is_te_min_version("2.3.0", check_equality=True):
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                interleaved=interleaved,
+            )
+        elif is_te_min_version("1.12.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
                 freqs,
@@ -2416,6 +2534,14 @@ except ImportError:
     fused_sort_chunks_by_index = None
     fused_sort_chunks_by_index_with_probs = None
     fused_unpermute = None
+
+try:
+    from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs
+
+    fused_permute_and_pad_with_probs = moe_permute_and_pad_with_probs
+
+except ImportError:
+    fused_permute_and_pad_with_probs = None
 
 try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
@@ -2531,3 +2657,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

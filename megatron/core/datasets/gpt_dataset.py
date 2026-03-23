@@ -61,8 +61,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True, 
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
@@ -78,6 +78,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
+
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -340,7 +343,7 @@ class GPTDataset(MegatronDataset):
             sample_parts.append(
                 self.dataset.get(
                     self.document_index[doc_index_beg],
-                    offset=doc_index_beg_offset,
+                    offset=int(doc_index_beg_offset),
                     length=doc_index_end_offset
                     - doc_index_beg_offset
                     + self.config.add_extra_token_to_sequence,
@@ -361,7 +364,7 @@ class GPTDataset(MegatronDataset):
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
                 sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=offset, length=length)
+                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )
         assert len(document_ids) == len(
             sample_parts

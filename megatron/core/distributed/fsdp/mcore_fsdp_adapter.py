@@ -42,7 +42,7 @@ from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
@@ -76,6 +76,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
@@ -84,6 +86,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
+
+        if config.gradient_accumulation_fusion:
+            assert is_te_min_version("2.10"), (
+                "Megatron-FSDP with gradient_accumulation_fusion requires "
+                "Transformer Engine version 2.10 or higher."
+            )
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
@@ -254,7 +262,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             expt_tp_group = single_rank_group
 
         if enable_hsdp:
-            if expt_dp_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
                     outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
                 )
@@ -283,7 +291,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
             )
         else:
-            if ep_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],

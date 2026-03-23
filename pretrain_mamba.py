@@ -32,12 +32,11 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -95,7 +94,7 @@ def get_batch(data_iterator, vp_stage=None):
     cu_seqlens = batch['cu_seqlens']
     # Unused at the moment
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    # Support for Hybrid Context Parallel (Unused in this script)
+    # Support for Dynamic Context Parallel (Unused in this script)
     local_cp_size = batch.pop('local_cp_size', None)
 
     if cu_seqlens is not None:
@@ -257,6 +256,7 @@ def forward_step(data_iterator, model: MambaModel):
             attention_mask,
             labels=labels,
             packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -273,10 +273,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]

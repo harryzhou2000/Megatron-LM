@@ -62,14 +62,23 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
+    """
+
+    dynamic_context_parallel: bool = False
+    """
+    If true, enables dynamic context parallel. This is used to balance the workload of 
+    each CP rank when we use packed samples with variable sequence lengths.
+    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
     """
 
     hybrid_context_parallel: bool = False
+    """Deprecated. Use ``dynamic_context_parallel`` instead."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
-    each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
     """
 
     expert_model_parallel_size: int = 1
@@ -78,11 +87,6 @@ class ModelParallelConfig:
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
        Default is None, which will be set to the value of tensor_model_parallel_size.
-    """
-
-    moe_extended_tp: bool = False
-    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
-      Its functionality is replaced by expert_tensor_parallel_size.
     """
 
     ###################
@@ -175,9 +179,6 @@ class ModelParallelConfig:
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
        must turn off gradient accumulation fusion.
     """
-
-    async_tensor_model_parallel_allreduce: bool = True
-    """NOTE: Deprecated. This flag is ignored."""
 
     use_te_rng_tracker: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
@@ -414,6 +415,19 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated and will be removed in a future release. "
+                "Use dynamic_context_parallel instead.",
+                DeprecationWarning,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel. "
+                    "Please use dynamic_context_parallel only."
+                )
+            self.dynamic_context_parallel = True
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

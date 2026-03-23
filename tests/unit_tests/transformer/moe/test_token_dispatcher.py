@@ -2,14 +2,16 @@
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
@@ -31,6 +33,48 @@ def token_unpermutation(token_dispatcher, hidden_states):
     hidden_states = token_dispatcher.token_combine(hidden_states)
     hidden_states = token_dispatcher.combine_postprocess(hidden_states)
     return hidden_states, None
+
+
+class _NestedAttrTestDispatcher(MoETokenDispatcher):
+    def dispatch_preprocess(self, tokens, routing_map, probs):
+        raise NotImplementedError
+
+    def token_dispatch(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def combine_preprocess(self, hidden_states):
+        raise NotImplementedError
+
+    def token_combine(self, hidden_states):
+        raise NotImplementedError
+
+    def combine_postprocess(self, hidden_states):
+        raise NotImplementedError
+
+
+def test_get_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    token_probs = torch.randn(2, 3)
+    dispatcher._comm_manager = SimpleNamespace(
+        token_probs=token_probs, nested=SimpleNamespace(routing_map=torch.randn(2, 4))
+    )
+
+    assert dispatcher.get_cudagraph_attr("_comm_manager.token_probs") is token_probs
+    assert dispatcher.get_cudagraph_attr("_comm_manager.nested.routing_map") is not None
+    assert dispatcher.get_cudagraph_attr("_comm_manager.missing_attr") is None
+
+
+def test_set_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    dispatcher._comm_manager = SimpleNamespace(routing_map=None)
+    routing_map = torch.randn(4, 5)
+
+    dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
+
+    assert dispatcher._comm_manager.routing_map is routing_map
 
 
 class MoEModelTestContainer:
@@ -99,15 +143,11 @@ class MoEModelTestContainer:
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = (
-            MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules)
-            .cuda()
-            .to(dtype=self.test_dtype)
-        )
+        moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
 
@@ -364,7 +404,6 @@ class TestAllgatherDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
@@ -383,7 +422,6 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
