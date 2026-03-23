@@ -977,6 +977,7 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = tokens_per_expert.long().cpu().tolist()
 
         actual_tokens_per_expert = None
+        permuted_probs = permuted_probs.unsqueeze(-1)
         if self.config.moe_router_padding_for_quantization:
             # Padding has already been applied in router
             pass
@@ -989,10 +990,8 @@ class TEGroupedMLP(MegatronModule):
                 permuted_local_hidden_states, tokens_per_expert
             )
             permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                permuted_probs, actual_tokens_per_expert
             )
-        else:
-            permuted_probs = permuted_probs.unsqueeze(-1)
 
         permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
         received_num_tokens = permuted_local_hidden_states.shape[0]
