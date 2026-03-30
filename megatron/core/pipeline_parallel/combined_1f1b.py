@@ -10,14 +10,31 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
+    ActivationPool,
     ScheduleNode,
+    get_activation_pool,
     get_comp_stream,
+    set_activation_pool,
     set_streams,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _ensure_activation_pool():
+    """Lazily create and enable the global activation pool for combined_1f1b.
+
+    The pool avoids cudaMalloc/cudaFree churn from free_input + resize_(0)
+    in ScheduleNode._forward.  Under full-iteration CUDA graph capture it
+    also eliminates private-pool inflation and record_stream fragmentation.
+    """
+    pool = get_activation_pool()
+    if pool is None:
+        pool = ActivationPool()
+        set_activation_pool(pool)
+    pool.enable()
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -53,6 +70,8 @@ def combined_1f1b_schedule_for_no_pipelining(
     """
 
     set_streams()
+    _ensure_activation_pool()
+
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -179,6 +198,8 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     """
 
     set_streams()
+    _ensure_activation_pool()
+
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
