@@ -562,7 +562,13 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.zeros(1, dtype=torch.int64, device=dev)
+            # Use torch.zeros when cu_seqlens is None to avoid the CPU-to-GPU scalar copy, for full-iter cuda-graph
+            # When n > 0, packing is in use and CUDA graph is not expected.
+            n_tensor = (
+                torch.zeros((), dtype=torch.int64, device=dev)
+                if cu_seqlens is None
+                else torch.tensor(n, dtype=torch.int64, device=dev)
+            )
             _broadcast(n_tensor)
 
             if n == 0:
