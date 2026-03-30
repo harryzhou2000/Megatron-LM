@@ -599,10 +599,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Need to record tensors created on comp stream to comm stream
-        node.layer_state.residual.record_stream(torch.cuda.current_stream())
-        if shared_expert_output is not None:
-            shared_expert_output.record_stream(torch.cuda.current_stream())
+        # Note: residual and shared_expert_output were created on the compute stream 
+        # and consumed here on the comm stream (by combine).
+        # The combined_1f1b schedule's event synchronization guarantees that the comm stream 
+        # has finished reading these tensors before any future
+        # operation can reuse their memory, so record_stream() is unnecessary.
+        # Skipping it avoids deferred frees under CUDA graph capture.
 
         # release tensor reference after use
         node.layer_state.residual = None
