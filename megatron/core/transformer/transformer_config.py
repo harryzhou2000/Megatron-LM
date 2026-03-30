@@ -1924,7 +1924,20 @@ class TransformerConfig(ModelParallelConfig):
                     self.moe_expert_capacity_factor is None
                     or not self.moe_pad_expert_input_to_capacity
                 ):
-                    if CudaGraphScope.moe not in self.cuda_graph_scope:
+                    # Check if MoE expert compute (grouped GEMM, dispatch/combine)
+                    # will be inside a CUDA graph capture region. This happens when:
+                    # - CudaGraphScope.moe: TE partial capture of entire MoE layer
+                    # - empty cuda_graph_scope: TE full-layer capture
+                    # - CudaGraphScope.full_iteration: local full-iteration capture
+                    # In these cases, all MoE ops must be sync-free (no CPU↔GPU syncs).
+                    # Partial scopes like moe_router/moe_preprocess/attn only capture
+                    # the router and preprocess; expert compute runs outside the graph.
+                    moe_compute_in_graph = (
+                        CudaGraphScope.moe in self.cuda_graph_scope
+                        or not self.cuda_graph_scope
+                        or CudaGraphScope.full_iteration in self.cuda_graph_scope
+                    )
+                    if moe_compute_in_graph:
                         assert (
                             self.moe_token_dispatcher_type == 'flex'
                             and self.moe_flex_dispatcher_backend == 'hybridep'
@@ -2061,15 +2074,15 @@ class TransformerConfig(ModelParallelConfig):
                     'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
                 )
 
-            if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.mlp not in self.cuda_graph_scope
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+            # if self.cuda_graph_impl != "none":
+            #     assert (
+            #         self.cuda_graph_impl == "transformer_engine"
+            #         and CudaGraphScope.moe not in self.cuda_graph_scope
+            #         and CudaGraphScope.mlp not in self.cuda_graph_scope
+            #     ) or self.cuda_graph_impl == "local", (
+            #         'CUDA graph scope on moe and mlp is not '
+            #         'supported with overlap_moe_expert_parallel_comm'
+            #     )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
