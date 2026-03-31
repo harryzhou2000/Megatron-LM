@@ -217,13 +217,14 @@ class ScheduleNode:
 
             self.output = data
 
-            # Free input storage for nodes that no longer need it after forward (e.g. mlp, combine).  
-            # The combined_1f1b schedule's event synchronization already guarantees that all prior GPU
-            # reads of these tensors have completed before any future writer can start
-            if self.free_input:
-                for input in inputs:
-                    if input is not None:
-                        input.untyped_storage().resize_(0)
+        # Immediately frees input tensors after they are used for nodes
+        # where inputs are no longer needed after computation.
+        if self.free_input:
+            for input in inputs:
+                if input is not None:
+                    if not torch.cuda.is_current_stream_capturing():
+                        input.record_stream(self.stream)
+                    input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -251,12 +252,12 @@ class ScheduleNode:
             )
             output_grad = self.backward_func(outputs, output_grad)
 
-        # output_grad may originate from another stream 
-        # The combined_1f1b schedule's event synchronization already orders all cross-stream accesses; 
-        # skipping avoids deferred frees under CG capture.
+        # output_grad maybe from another stream
         if output_grad:
             for g in output_grad:
                 if g is not None:
+                    if not torch.cuda.is_current_stream_capturing():
+                        g.record_stream(self.stream)
                     # Manually trigger the memory release of dgrad tensor
                     # to avoid delayed garbage collection. If
                     # delay_grads_release is True, dgrad is last used in
