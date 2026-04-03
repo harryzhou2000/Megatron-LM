@@ -25,6 +25,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, make_v
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
 
+
 def weak_method(method):
     """Creates a weak reference to a method to prevent circular references.
 
@@ -598,11 +599,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if not torch.cuda.is_current_stream_capturing():
-            # Need to record tensors created on comp stream to comm stream
-            node.layer_state.residual.record_stream(torch.cuda.current_stream())
-            if shared_expert_output is not None:
-                shared_expert_output.record_stream(torch.cuda.current_stream())
+        # Need to record tensors created on comp stream to comm stream
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
+        if shared_expert_output is not None:
+            shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None

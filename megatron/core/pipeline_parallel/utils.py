@@ -222,8 +222,7 @@ class ScheduleNode:
         if self.free_input:
             for input in inputs:
                 if input is not None:
-                    if not torch.cuda.is_current_stream_capturing():
-                        input.record_stream(self.stream)
+                    input.record_stream(self.stream)
                     input.untyped_storage().resize_(0)
 
         return self.output
@@ -256,8 +255,7 @@ class ScheduleNode:
         if output_grad:
             for g in output_grad:
                 if g is not None:
-                    if not torch.cuda.is_current_stream_capturing():
-                        g.record_stream(self.stream)
+                    g.record_stream(self.stream)
                     # Manually trigger the memory release of dgrad tensor
                     # to avoid delayed garbage collection. If
                     # delay_grads_release is True, dgrad is last used in
