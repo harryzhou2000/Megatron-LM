@@ -141,6 +141,7 @@ class TestFullIterCGScheduleChunk1F1B:
         # Reset the comm stream singleton so Run 2 creates a fresh one
         # on the correct device after initialize_model_parallel.
         from megatron.core.pipeline_parallel import utils as pp_utils
+
         pp_utils._COMM_STREAM = None
         Utils.destroy_model_parallel()
         destroy_global_vars()
@@ -151,14 +152,10 @@ class TestFullIterCGScheduleChunk1F1B:
         """Model provider for setup_model_and_optimizer."""
         args = get_args()
         model_parallel_cuda_manual_seed(
-            123,
-            te_rng_tracker=args.use_te_rng_tracker,
-            force_reset_rng=True,
+            123, te_rng_tracker=args.use_te_rng_tracker, force_reset_rng=True
         )
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = get_gpt_decoder_block_spec(
-            config, use_transformer_engine=True
-        )
+        transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
         mtp_block_spec = None
         if args.mtp_num_layers:
             mtp_block_spec = get_gpt_mtp_block_spec(
@@ -217,7 +214,6 @@ class TestFullIterCGScheduleChunk1F1B:
         args.hidden_dropout = 0.0
         args.attention_dropout = 0.0
         args.untie_embeddings_and_output_weights = True
-        
 
         # MoE settings -- production-like
         args.num_experts = 8
@@ -313,9 +309,7 @@ class TestFullIterCGScheduleChunk1F1B:
         args = self.create_test_args(cuda_graph_warmup_steps=cuda_graph_warmup_steps)
         set_args(args)
         torch.manual_seed(123)
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, expert_model_parallel_size=4
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=4)
         # set_streams must be called after initialize_model_parallel so that
         # torch.cuda.set_device has been called and the comm stream is created
         # on the correct per-rank device.
@@ -346,8 +340,7 @@ class TestFullIterCGScheduleChunk1F1B:
         # Wrap with FullCudaGraphWrapper if requested -- exactly as production does
         if use_full_iter_cg:
             forward_backward_func = FullCudaGraphWrapper(
-                forward_backward_func,
-                cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+                forward_backward_func, cuda_graph_warmup_steps=cuda_graph_warmup_steps
             )
 
         # Use >=2 microbatches to exercise inter-microbatch overlap in
@@ -391,9 +384,7 @@ class TestFullIterCGScheduleChunk1F1B:
         return losses
 
     @pytest.mark.skipif(not _is_blackwell(), reason="Requires Blackwell GPU (SM >= 100) for MXFP8")
-    @pytest.mark.skipif(
-        not _is_hybrid_ep_available(), reason="HybridEP dispatcher not available"
-    )
+    @pytest.mark.skipif(not _is_hybrid_ep_available(), reason="HybridEP dispatcher not available")
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_full_iter_cg_combined_1f1b(self):
         """
@@ -416,9 +407,7 @@ class TestFullIterCGScheduleChunk1F1B:
         num_steps = cuda_graph_warmup_steps + 2
 
         # --- Run 1: Eager baseline (same model config, no FullCudaGraphWrapper) ---
-        eager_losses = self._run_training_steps(
-            use_full_iter_cg=False, num_steps=num_steps
-        )
+        eager_losses = self._run_training_steps(use_full_iter_cg=False, num_steps=num_steps)
 
         # --- Run 2: Full-iteration CUDA graph ---
         cg_losses = self._run_training_steps(
@@ -428,9 +417,9 @@ class TestFullIterCGScheduleChunk1F1B:
         )
 
         # --- Compare ---
-        assert len(eager_losses) == len(cg_losses), (
-            f"Loss count mismatch: eager={len(eager_losses)}, cg={len(cg_losses)}"
-        )
+        assert len(eager_losses) == len(
+            cg_losses
+        ), f"Loss count mismatch: eager={len(eager_losses)}, cg={len(cg_losses)}"
         for i, (eager_loss, cg_loss) in enumerate(zip(eager_losses, cg_losses)):
             assert torch.equal(eager_loss, cg_loss), (
                 f"[rank {torch.distributed.get_rank()}] "

@@ -1027,7 +1027,7 @@ class TEGroupedMLP(MegatronModule):
             )
             output_bias = None
             return output, output_bias
-        
+
         if self.config.moe_use_device_initiated_grouped_gemm:
             tokens_per_expert = tokens_per_expert.long().cuda()
         else:
@@ -1046,9 +1046,7 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs, actual_tokens_per_expert
-            )
+            permuted_probs, _ = self.quantization_padding(permuted_probs, actual_tokens_per_expert)
 
         permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
         received_num_tokens = permuted_local_hidden_states.shape[0]
