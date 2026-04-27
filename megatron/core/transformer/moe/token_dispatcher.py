@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_HYBRIDEP_DENSE_ROUTING,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
@@ -982,6 +983,7 @@ class _HybridEPManager(_DispatchManager):
         num_local_experts: int,
         num_experts: int,
         config: TransformerConfig,
+        router_topk: int = None,
     ):
         """
         Initialize the HybridEP dispatcher.
@@ -992,11 +994,14 @@ class _HybridEPManager(_DispatchManager):
             num_local_experts (int): The number of local experts.
             num_experts (int): The total number of experts in the group.
             config (TransformerConfig): The configuration for the transformer model.
+            router_topk (int): The top-k value after TP expansion (topk * tp_size).
+                Used for dense routing to recover topk_idx from the bool routing_map.
         """
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
         self.config = config
+        self.router_topk = router_topk if router_topk is not None else config.moe_router_topk
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
@@ -1026,6 +1031,25 @@ class _HybridEPManager(_DispatchManager):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
+
+        # Extract topk_idx from the probs for dense routing mode.
+        # Dense routing passes topk_idx as int16 instead of a bool routing_map,
+        # reducing allgather traffic by ~(num_experts / (2 * topk))x.
+        # We use topk(probs) which always returns a fixed-shape [T, K] output
+        # (sync-free). Dropped tokens (capacity_factor) have zeroed probs;
+        # we mask their indices with -1 so the scan kernel ignores them
+        # (65535 as uint16 won't match any valid expert range).
+        if HAVE_HYBRIDEP_DENSE_ROUTING:
+            _, self.topk_idx = torch.topk(
+                self.token_probs, self.router_topk, dim=-1
+            )
+            self.topk_idx = self.topk_idx.to(torch.int16)
+            if self.capacity_factor is not None:
+                mask = self.token_probs.gather(1, self.topk_idx.long()) == 0
+                self.topk_idx = self.topk_idx.masked_fill(mask, -1)
+        else:
+            self.topk_idx = None
+
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1076,6 +1100,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
+                topk_idx=self.topk_idx,
             )
         )
 
@@ -1400,6 +1425,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_local_experts=self.num_local_experts,
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
+                router_topk=self.tp_size * self.config.moe_router_topk,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
         else:
