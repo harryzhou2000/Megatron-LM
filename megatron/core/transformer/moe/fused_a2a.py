@@ -491,12 +491,23 @@ else:
 
 
 try:
+    import inspect
+
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
+    # Check if the installed HybridEPBuffer supports dense_routing mode,
+    # which passes topk_idx directly as int16 instead of a bool routing_map.
+    try:
+        _sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+        HAVE_HYBRIDEP_DENSE_ROUTING = "dense_routing" in _sig.parameters
+        del _sig
+    except (ValueError, TypeError):
+        HAVE_HYBRIDEP_DENSE_ROUTING = False
 except ImportError:
     HAVE_HYBRIDEP = False
-
+    HAVE_HYBRIDEP_DENSE_ROUTING = False
+# HAVE_HYBRIDEP_DENSE_ROUTING = False
 _hybrid_ep_buffer = None
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
@@ -564,6 +575,7 @@ def init_hybrid_ep_buffer(
         max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
+        enable_custom_allgather=False,
         **kwargs,
     )
 
@@ -597,6 +609,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -636,24 +649,48 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        # Process the dispatch
-        (
-            dispatched_hidden,
-            dispatched_probs,
-            dispatched_scaling_factor,
-            tokens_per_expert,
-            handle,
-        ) = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=x,
-            routing_map=routing_map,
-            probs=probs,
-            scaling_factor=None,
-            num_of_experts_per_rank=num_local_experts,
-            pad_multiple=pad_multiple,
-            num_permuted_tokens=num_permuted_tokens,
-            non_blocking=non_blocking,
-            **({"fuse_permute_dispatch": fused} if fused else {}),
-        )
+
+        # Use dense routing when topk_idx is provided and the backend supports it
+        use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
+
+        if use_dense:
+            (
+                dispatched_hidden,
+                dispatched_probs,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle,
+            ) = _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=x,
+                topk_idx=topk_idx,
+                probs=probs,
+                scaling_factor=None,
+                num_of_experts=routing_map.size(-1),
+                num_of_experts_per_rank=num_local_experts,
+                pad_multiple=pad_multiple,
+                num_permuted_tokens=num_permuted_tokens,
+                non_blocking=non_blocking,
+                dense_routing=True,
+                **({"fuse_permute_dispatch": fused} if fused else {}),
+            )
+        else:
+            (
+                dispatched_hidden,
+                dispatched_probs,
+                dispatched_scaling_factor,
+                tokens_per_expert,
+                handle,
+            ) = _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=x,
+                routing_map=routing_map,
+                probs=probs,
+                scaling_factor=None,
+                num_of_experts_per_rank=num_local_experts,
+                pad_multiple=pad_multiple,
+                num_permuted_tokens=num_permuted_tokens,
+                non_blocking=non_blocking,
+                **({"fuse_permute_dispatch": fused} if fused else {}),
+            )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -679,10 +716,14 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
+        # Gradients for: x, routing_map, probs, group, num_local_experts,
+        #   num_sms_dispatch_api, num_sms_combine_api, num_permuted_tokens,
+        #   pad_multiple, topk_idx
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -753,6 +794,7 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -762,7 +804,9 @@ if HAVE_HYBRIDEP:
             x (torch.Tensor):
                 Input hidden states to dispatch.
             routing_map (torch.Tensor):
-                Map indicating which expert each token is routed to.
+                Map indicating which expert each token is routed to. Always
+                required; its last dimension also provides num_experts for the
+                dense routing path.
             probs (torch.Tensor):
                 Routing probabilities for each token-expert pair.
             group (torch.distributed.ProcessGroup):
@@ -786,6 +830,10 @@ if HAVE_HYBRIDEP:
                 is performed.
             num_sms_preprocessing_api (int):
                 Number of SMs used by the preprocessing (metadata scan) kernel.
+            topk_idx (torch.Tensor, optional):
+                Top-k expert indices [num_tokens, topk] for dense routing mode.
+                When provided and the backend supports it, the bool routing_map
+                allgather is replaced with a much smaller int16 allgather.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -801,6 +849,7 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            topk_idx,
         )
 
     @internal_api
