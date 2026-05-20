@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -43,6 +44,19 @@ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_DENSE_ROUTING = os.getenv("MCORE_DEBUG_DENSE_ROUTING", "0") == "1"
+_DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED = False
+_DEBUG_DENSE_ROUTING_HYBRIDEP_DISPATCH_PRINTED = False
+
+
+def _debug_dense_routing_print(message: str) -> None:
+    if not _DEBUG_DENSE_ROUTING:
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    print(message, flush=True)
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -1124,6 +1138,16 @@ class _HybridEPManager(_DispatchManager):
         # (65535 as uint16 won't match any valid expert range).
         if provided_topk_idx is not None:
             self.topk_idx = provided_topk_idx.to(torch.int16)
+            global _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED
+            if not _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED:
+                _debug_dense_routing_print(
+                    "[MCore dense-routing debug][hybridep metadata] received dense "
+                    f"routing_map/topk_idx dtype={provided_topk_idx.dtype} "
+                    f"shape={tuple(provided_topk_idx.shape)}; skipping "
+                    "torch.topk(probs) / bool routing_map-to-indices conversion; "
+                    f"stored topk_idx dtype={self.topk_idx.dtype}"
+                )
+                _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED = True
         elif HAVE_HYBRIDEP_DENSE_ROUTING:
             _, self.topk_idx = torch.topk(
                 self.token_probs, self.router_topk, dim=-1
@@ -1189,6 +1213,16 @@ class _HybridEPManager(_DispatchManager):
             hidden_states = torch.cat(
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
+        if self.routing_map is None and self.topk_idx is not None:
+            global _DEBUG_DENSE_ROUTING_HYBRIDEP_DISPATCH_PRINTED
+            if not _DEBUG_DENSE_ROUTING_HYBRIDEP_DISPATCH_PRINTED:
+                _debug_dense_routing_print(
+                    "[MCore dense-routing debug][hybridep dispatch] calling HybridEP dense "
+                    f"path with topk_idx dtype={self.topk_idx.dtype} "
+                    f"shape={tuple(self.topk_idx.shape)} num_of_experts={self.num_experts}; "
+                    "routing_map=None so HybridEP consumes dense topk_idx directly"
+                )
+                _DEBUG_DENSE_ROUTING_HYBRIDEP_DISPATCH_PRINTED = True
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
