@@ -692,6 +692,7 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -716,6 +717,8 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -753,6 +756,7 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            topk_indices=topk_indices,
         )
 
     def _compute_topk(
@@ -830,6 +834,11 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
+
+    if topk_indices is not None:
+        topk_indices.copy_(top_indices.to(topk_indices.dtype))
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        return routing_probs, topk_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
