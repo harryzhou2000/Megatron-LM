@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
@@ -41,6 +42,19 @@ class _AuxLossGroupConfig:
     def metric_pre_reduce_groups(self) -> Optional[Sequence[torch.distributed.ProcessGroup]]:
         """Groups to reduce eagerly before recording metrics, if tracker reduction is unsafe."""
         return self.loss_reduce_groups if self.metric_avg_group is not None else None
+
+
+_DEBUG_DENSE_ROUTING = os.getenv("MCORE_DEBUG_DENSE_ROUTING", "0") == "1"
+_DEBUG_DENSE_ROUTING_ROUTER_PRINTED = False
+
+
+def _debug_dense_routing_print(message: str) -> None:
+    if not _DEBUG_DENSE_ROUTING:
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    print(message, flush=True)
 
 
 class Router(ABC, MegatronModule):
@@ -892,6 +906,18 @@ class TopKRouter(Router):
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
             )
+            if topk_indices is not None:
+                global _DEBUG_DENSE_ROUTING_ROUTER_PRINTED
+                if not _DEBUG_DENSE_ROUTING_ROUTER_PRINTED:
+                    _debug_dense_routing_print(
+                        "[MCore dense-routing debug][router] TE fused router requested dense "
+                        f"topk_indices dtype={topk_indices.dtype} shape={tuple(topk_indices.shape)}; "
+                        f"returned routing_map dtype={routing_map.dtype} "
+                        f"shape={tuple(routing_map.shape)} "
+                        f"same_buffer={routing_map.data_ptr() == topk_indices.data_ptr()} "
+                        f"backend={self.config.moe_flex_dispatcher_backend}"
+                    )
+                    _DEBUG_DENSE_ROUTING_ROUTER_PRINTED = True
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
         # rows before dispatch. Other dispatchers retain their existing fixed-route
