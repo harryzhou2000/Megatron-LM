@@ -696,6 +696,7 @@ def topk_routing_with_score_function(
     dense_output: bool = False,
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -724,6 +725,8 @@ def topk_routing_with_score_function(
                                                with shape [num_experts, num_bins].
         qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
                                                 K3 Quantile Balancing histogram bounds.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -786,6 +789,7 @@ def topk_routing_with_score_function(
             "scaling_factor": scaling_factor,
             "score_function": score_function,
             "expert_bias": expert_bias,
+            "topk_indices": topk_indices,
         }
         if use_quantile_balancing:
             if not fused_topk_with_score_function_supports_qb:
@@ -896,6 +900,11 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
+
+    if topk_indices is not None:
+        topk_indices.copy_(top_indices.to(topk_indices.dtype))
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        return routing_probs, topk_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]

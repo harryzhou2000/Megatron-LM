@@ -10,6 +10,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -26,7 +27,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 
 @dataclass(frozen=True)
 class _AuxLossGroupConfig:
@@ -360,6 +360,26 @@ class TopKRouter(Router):
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
+
+    def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
+        """Return dense route-index dtype for Flex backends that consume top-k indices."""
+        if not self.config.moe_router_fusion:
+            return None
+        if self.config.moe_token_dispatcher_type != "flex":
+            return None
+        if self.config.moe_expert_capacity_factor is not None:
+            return None
+        if self.enable_expert_bias:
+            return None
+
+        backend = self.config.moe_flex_dispatcher_backend
+        if backend == "deepep":
+            return torch.int64
+        if backend == "hybridep" and HAVE_HYBRIDEP_DENSE_ROUTING:
+            dense_num_experts = self.tp_group.size() * self.config.num_moe_experts
+            if dense_num_experts <= torch.iinfo(torch.int16).max:
+                return torch.int16
+        return None
 
     def _apply_aux_loss(
         self,
@@ -851,6 +871,12 @@ class TopKRouter(Router):
                     "Quantile Balancing does not yet support padding masks because the "
                     "histogram APIs do not accept a valid-token mask."
                 )
+            topk_indices = None
+            topk_indices_dtype = self._dense_route_indices_dtype()
+            if topk_indices_dtype is not None:
+                topk_indices = torch.empty(
+                    (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
+                )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -864,6 +890,7 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
+                topk_indices=topk_indices,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding

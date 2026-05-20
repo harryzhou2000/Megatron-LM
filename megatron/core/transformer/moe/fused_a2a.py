@@ -610,6 +610,7 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
         num_sms_preprocessing_api=108,
         topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -652,6 +653,8 @@ class HybridEPDispatch(torch.autograd.Function):
 
         # Use dense routing when topk_idx is provided and the backend supports it
         use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
+        if use_dense:
+            assert num_of_experts is not None, "num_of_experts is required for dense routing"
 
         if use_dense:
             (
@@ -665,7 +668,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 topk_idx=topk_idx,
                 probs=probs,
                 scaling_factor=None,
-                num_of_experts=routing_map.size(-1),
+                num_of_experts=num_of_experts,
                 num_of_experts_per_rank=num_local_experts,
                 pad_multiple=pad_multiple,
                 num_permuted_tokens=num_permuted_tokens,
@@ -718,11 +721,12 @@ class HybridEPDispatch(torch.autograd.Function):
         )
         # Gradients for: x, routing_map, probs, group, num_local_experts,
         #   num_sms_dispatch_api, num_sms_combine_api, num_permuted_tokens,
-        #   pad_multiple, topk_idx
+        #   pad_multiple, topk_idx, num_of_experts
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -795,6 +799,7 @@ if HAVE_HYBRIDEP:
         pad_multiple=None,
         num_sms_preprocessing_api=108,
         topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -834,6 +839,8 @@ if HAVE_HYBRIDEP:
                 Top-k expert indices [num_tokens, topk] for dense routing mode.
                 When provided and the backend supports it, the bool routing_map
                 allgather is replaced with a much smaller int16 allgather.
+            num_of_experts (int, optional):
+                Total number of dense routing experts. Required when topk_idx is provided.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -850,6 +857,7 @@ if HAVE_HYBRIDEP:
             pad_multiple,
             num_sms_preprocessing_api,
             topk_idx,
+            num_of_experts,
         )
 
     @internal_api
