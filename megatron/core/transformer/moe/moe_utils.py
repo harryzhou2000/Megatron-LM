@@ -38,6 +38,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_qb,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -55,6 +56,7 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
     fused_topk_with_score_function_supports_qb = False
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def switch_load_balancing_loss_func(
@@ -789,7 +791,6 @@ def topk_routing_with_score_function(
             "scaling_factor": scaling_factor,
             "score_function": score_function,
             "expert_bias": expert_bias,
-            "topk_indices": topk_indices,
         }
         if use_quantile_balancing:
             if not fused_topk_with_score_function_supports_qb:
@@ -803,6 +804,8 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if fused_topk_with_score_function_supports_topk_indices:
+            kwargs["topk_indices"] = topk_indices
         return fused_topk_with_score_function(**kwargs)
 
     def _compute_topk(
