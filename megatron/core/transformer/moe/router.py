@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
+    fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     sinkhorn,
@@ -46,6 +47,7 @@ class _AuxLossGroupConfig:
 
 _DEBUG_DENSE_ROUTING = os.getenv("MCORE_DEBUG_DENSE_ROUTING", "0") == "1"
 _DEBUG_DENSE_ROUTING_ROUTER_PRINTED = False
+_DEBUG_DENSE_ROUTING_DISABLED_PRINTED = False
 
 
 def _debug_dense_routing_print(message: str) -> None:
@@ -55,6 +57,15 @@ def _debug_dense_routing_print(message: str) -> None:
         if torch.distributed.get_rank() != 0:
             return
     print(message, flush=True)
+
+
+def _debug_dense_routing_disabled(reason: str) -> None:
+    """Print a one-shot explanation when dense top-k indices are not requested."""
+    global _DEBUG_DENSE_ROUTING_DISABLED_PRINTED
+    if _DEBUG_DENSE_ROUTING_DISABLED_PRINTED:
+        return
+    _debug_dense_routing_print(f"[MCore dense-routing debug][router disabled] {reason}")
+    _DEBUG_DENSE_ROUTING_DISABLED_PRINTED = True
 
 
 class Router(ABC, MegatronModule):
@@ -348,21 +359,54 @@ class TopKRouter(Router):
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return dense route-index dtype for Flex backends that consume top-k indices."""
         if not self.config.moe_router_fusion:
+            _debug_dense_routing_disabled("moe_router_fusion=False")
             return None
         if self.config.moe_token_dispatcher_type != "flex":
+            _debug_dense_routing_disabled(
+                f"moe_token_dispatcher_type={self.config.moe_token_dispatcher_type!r}; "
+                "expected 'flex'"
+            )
             return None
         if self.config.moe_expert_capacity_factor is not None:
+            _debug_dense_routing_disabled(
+                "moe_expert_capacity_factor is set; router token dropping currently requires "
+                "the sparse bool routing_map"
+            )
             return None
         if self.enable_expert_bias:
+            _debug_dense_routing_disabled("moe_router_enable_expert_bias=True")
+            return None
+        if not fused_topk_with_score_function_supports_topk_indices:
+            _debug_dense_routing_disabled(
+                "installed TE fused_topk_with_score_function does not expose topk_indices; "
+                "using sparse bool routing_map path"
+            )
             return None
 
         backend = self.config.moe_flex_dispatcher_backend
         if backend == "deepep":
             return torch.int64
-        if backend == "hybridep" and HAVE_HYBRIDEP_DENSE_ROUTING:
+        if backend == "hybridep":
+            if not HAVE_HYBRIDEP_DENSE_ROUTING:
+                _debug_dense_routing_disabled(
+                    "moe_flex_dispatcher_backend='hybridep' but installed deep_ep "
+                    "HybridEPBuffer.dispatch_with_permute does not expose dense_routing"
+                )
+                return None
             dense_num_experts = self.tp_group.size() * self.config.num_moe_experts
-            if dense_num_experts <= torch.iinfo(torch.int16).max:
+            int16_max = torch.iinfo(torch.int16).max
+            if dense_num_experts <= int16_max:
                 return torch.int16
+            _debug_dense_routing_disabled(
+                "moe_flex_dispatcher_backend='hybridep' but dense expert id range does not fit "
+                f"int16: tp_group_size={self.tp_group.size()} "
+                f"num_moe_experts={self.config.num_moe_experts} "
+                f"dense_num_experts={dense_num_experts} int16_max={int16_max}"
+            )
+            return None
+        _debug_dense_routing_disabled(
+            f"moe_flex_dispatcher_backend={backend!r}; expected 'deepep' or 'hybridep'"
+        )
         return None
 
     def _apply_aux_loss(
