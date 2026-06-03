@@ -417,6 +417,11 @@ class TopKRouter(Router):
         if backend == "deepep":
             return torch.int64
         if backend == "hybridep":
+            if not self.config.moe_hybridep_use_dense_routing_map:
+                _debug_dense_routing_disabled(
+                    "moe_hybridep_use_dense_routing_map=False; using sparse bool routing_map path"
+                )
+                return None
             if not HAVE_HYBRIDEP_DENSE_ROUTING:
                 _debug_dense_routing_disabled(
                     "moe_flex_dispatcher_backend='hybridep' but installed deep_ep "
