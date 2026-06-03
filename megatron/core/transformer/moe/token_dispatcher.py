@@ -1143,6 +1143,13 @@ class _HybridEPManager(_DispatchManager):
         # we mask their indices with -1 so the scan kernel ignores them
         # (65535 as uint16 won't match any valid expert range).
         if provided_topk_idx is not None:
+            int16_max = torch.iinfo(torch.int16).max
+            if self.num_experts > int16_max:
+                raise RuntimeError(
+                    "HybridEP dense routing map requires int16 expert ids, but the TP-expanded "
+                    f"expert range has {self.num_experts} entries, exceeding int16 max "
+                    f"{int16_max}. Use sparse routing or reduce the TP-expanded expert range."
+                )
             self.topk_idx = provided_topk_idx.to(torch.int16)
             global _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED
             if not _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED:
@@ -1246,6 +1253,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
                 topk_idx=self.topk_idx,
                 num_of_experts=self.num_experts,
+                use_custom_allgather=self.config.moe_hybridep_use_custom_allgather,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:

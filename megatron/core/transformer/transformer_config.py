@@ -974,6 +974,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_use_custom_allgather: bool = False
+    """Use HybridEP custom allgather for dispatch metadata exchange."""
+
     moe_hybridep_use_dense_routing_map: bool = True
     """Use dense top-k routing indices for HybridEP when supported. Disable this to force the
     sparse bool routing-map path for debugging or backend comparison."""
