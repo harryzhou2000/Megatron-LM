@@ -525,6 +525,7 @@ def init_hybrid_ep_buffer(
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
     num_sms_preprocessing_api: Optional[int] = None,
+    use_custom_allgather: bool = False,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -555,6 +556,8 @@ def init_hybrid_ep_buffer(
             Whether to use FP8 communication during the dispatch phase.
         num_sms_preprocessing_api (Optional[int]):
             Number of SMs used by the preprocessing (metadata scan) kernel.
+        use_custom_allgather (bool):
+            Whether to use HybridEP custom allgather for dispatch metadata exchange.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -575,7 +578,7 @@ def init_hybrid_ep_buffer(
         max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
-        enable_custom_allgather=False,
+        enable_custom_allgather=use_custom_allgather,
         **kwargs,
     )
 
@@ -611,6 +614,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        use_custom_allgather=False,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -646,12 +650,20 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute,
                 fp8_dispatch,
                 num_sms_preprocessing_api,
+                use_custom_allgather,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
 
-        # Use dense routing when topk_idx is provided and the backend supports it
+        if topk_idx is not None and not HAVE_HYBRIDEP_DENSE_ROUTING:
+            raise RuntimeError(
+                "HybridEP topk_idx was provided, but the installed HybridEPBuffer does not "
+                "support dense_routing. Use a newer HybridEP backend or pass a sparse "
+                "routing_map without topk_idx."
+            )
+
+        # Use dense routing when topk_idx is provided and the backend supports it.
         use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
         if use_dense:
             assert num_of_experts is not None, "num_of_experts is required for dense routing"
@@ -720,12 +732,14 @@ class HybridEPDispatch(torch.autograd.Function):
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
         # Gradients for: x, routing_map, probs, group, num_local_experts,
-        #   num_sms_dispatch_api, num_sms_combine_api, num_permuted_tokens,
-        #   pad_multiple, topk_idx, num_of_experts
+        #   num_sms_dispatch_api, num_sms_combine_api, num_blocks_permute,
+        #   num_blocks_unpermute, fused, num_permuted_tokens, pad_multiple,
+        #   num_sms_preprocessing_api, topk_idx, num_of_experts, use_custom_allgather
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -800,6 +814,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        use_custom_allgather=False,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -841,6 +856,8 @@ if HAVE_HYBRIDEP:
                 allgather is replaced with a much smaller int16 allgather.
             num_of_experts (int, optional):
                 Total number of dense routing experts. Required when topk_idx is provided.
+            use_custom_allgather (bool):
+                Whether to use HybridEP custom allgather for dispatch metadata exchange.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -858,6 +875,7 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             topk_idx,
             num_of_experts,
+            use_custom_allgather,
         )
 
     @internal_api
