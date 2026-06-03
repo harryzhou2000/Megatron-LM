@@ -409,7 +409,8 @@ class TopKRouter(Router):
         if not fused_topk_with_score_function_supports_topk_indices:
             _debug_dense_routing_disabled(
                 "installed TE fused_topk_with_score_function does not expose topk_indices; "
-                "using sparse bool routing_map path"
+                "TE returns a sparse bool routing_map. HybridEP may still convert that map to "
+                "dense indices inside the dispatcher when enabled."
             )
             return None
 
