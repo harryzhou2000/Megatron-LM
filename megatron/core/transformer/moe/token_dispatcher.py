@@ -1172,6 +1172,12 @@ class _HybridEPManager(_DispatchManager):
                 )
             self.routing_map = routing_map
         else:
+            if not HAVE_HYBRIDEP_DENSE_ROUTING:
+                raise RuntimeError(
+                    "HybridEP dense routing map was provided, but the installed HybridEPBuffer "
+                    "does not support dense_routing. Use a newer HybridEP backend or disable "
+                    "dense routing before this dispatcher path."
+                )
             self.routing_map = None
             provided_topk_idx = routing_map.reshape(num_tokens, self.router_topk).contiguous()
             if padded_num_tokens > num_tokens:
@@ -1209,7 +1215,7 @@ class _HybridEPManager(_DispatchManager):
                     f"stored topk_idx dtype={self.topk_idx.dtype}"
                 )
                 _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED = True
-        elif HAVE_HYBRIDEP_DENSE_ROUTING:
+        elif HAVE_HYBRIDEP_DENSE_ROUTING and self.config.moe_hybridep_use_dense_routing_map:
             _, self.topk_idx = torch.topk(
                 self.token_probs, self.router_topk, dim=-1
             )
