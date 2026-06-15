@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 _DEBUG_DENSE_ROUTING = os.getenv("MCORE_DEBUG_DENSE_ROUTING", "0") == "1"
 _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED = False
 _DEBUG_DENSE_ROUTING_HYBRIDEP_DISPATCH_PRINTED = False
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
 def _debug_dense_routing_print(message: str) -> None:
@@ -1204,12 +1205,12 @@ class _HybridEPManager(_DispatchManager):
         # we mask their indices with -1 so the scan kernel ignores them
         # (65535 as uint16 won't match any valid expert range).
         if provided_topk_idx is not None:
-            int16_max = torch.iinfo(torch.int16).max
-            if self.num_experts > int16_max:
+            if self.num_experts > _HYBRIDEP_INT16_EXPERT_LIMIT:
                 raise RuntimeError(
                     "HybridEP dense routing map requires int16 expert ids, but the TP-expanded "
-                    f"expert range has {self.num_experts} entries, exceeding int16 max "
-                    f"{int16_max}. Use sparse routing or reduce the TP-expanded expert range."
+                    f"expert range has {self.num_experts} entries, exceeding the HybridEP "
+                    f"int16 expert limit {_HYBRIDEP_INT16_EXPERT_LIMIT}. Use sparse routing "
+                    "or reduce the TP-expanded expert range."
                 )
             self.topk_idx = provided_topk_idx.to(torch.int16)
             global _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED
