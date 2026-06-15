@@ -48,6 +48,7 @@ class _AuxLossGroupConfig:
 _DEBUG_DENSE_ROUTING = os.getenv("MCORE_DEBUG_DENSE_ROUTING", "0") == "1"
 _DEBUG_DENSE_ROUTING_ROUTER_PRINTED = False
 _DEBUG_DENSE_ROUTING_DISABLED_PRINTED = False
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
 def _debug_dense_routing_print(message: str) -> None:
@@ -400,14 +401,14 @@ class TopKRouter(Router):
                 )
                 return None
             dense_num_experts = self.tp_group.size() * self.config.num_moe_experts
-            int16_max = torch.iinfo(torch.int16).max
-            if dense_num_experts <= int16_max:
+            if dense_num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
                 return torch.int16
             _debug_dense_routing_disabled(
                 "moe_flex_dispatcher_backend='hybridep' but dense expert id range does not fit "
                 f"int16: tp_group_size={self.tp_group.size()} "
                 f"num_moe_experts={self.config.num_moe_experts} "
-                f"dense_num_experts={dense_num_experts} int16_max={int16_max}"
+                f"dense_num_experts={dense_num_experts} "
+                f"int16_expert_limit={_HYBRIDEP_INT16_EXPERT_LIMIT}"
             )
             return None
         _debug_dense_routing_disabled(
