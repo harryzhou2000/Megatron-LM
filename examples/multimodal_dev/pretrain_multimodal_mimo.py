@@ -223,14 +223,6 @@ class Qwen35VLMimoModel(MimoModel):
             raise NotImplementedError(
                 "decoder_input is not supported by pretrain_multimodal_mimo yet"
             )
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "packed_seq_params is not supported by pretrain_multimodal_mimo yet"
-            )
-        if padding_mask is not None and padding_mask.any():
-            raise NotImplementedError(
-                "padding_mask forwarding is not supported by pretrain_multimodal_mimo yet"
-            )
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -249,13 +241,15 @@ class Qwen35VLMimoModel(MimoModel):
                 }
             }
 
-        output, _ = super().forward(
+        output, _ = self._forward_all_modules(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             labels=labels,
             modality_inputs=modality_inputs,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
         return output
 
@@ -268,6 +262,8 @@ class Qwen35VLMimoModel(MimoModel):
         labels,
         modality_inputs,
         packing_kwargs=None,
+        packed_seq_params=None,
+        padding_mask=None,
     ):
         """Forward colocated Qwen3.5-VL MIMO while preserving ``input_ids`` for MTP."""
         if packing_kwargs is not None:
@@ -303,6 +299,27 @@ class Qwen35VLMimoModel(MimoModel):
             special_token_ids=self.special_token_ids,
         )
 
+        if self.partition_adapter is not None:
+            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+            combined_embeddings, labels, loss_mask, _, packed_seq_params = self.partition_adapter.shard(
+                embeddings=combined_embeddings,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+            )
+            if combined_embeddings is not None:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+        if padding_mask is not None and self.config.sequence_parallel:
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.language_model.tp_group
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         lm_output = self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -310,6 +327,8 @@ class Qwen35VLMimoModel(MimoModel):
             decoder_input=combined_embeddings,
             labels=labels,
             loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
         )
         return lm_output, loss_mask
 
