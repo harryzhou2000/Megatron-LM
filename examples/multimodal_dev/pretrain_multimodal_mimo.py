@@ -144,11 +144,14 @@ def _build_module_parallel_context(args):
         vision_dp = world_size // vision_tp
 
     language_tp = args.tensor_model_parallel_size
-    language_ep = getattr(args, "expert_model_parallel_size", 1)
-    denom = language_tp * language_ep
+    # The MIMO grid describes activation/batch layout for the colocated bridge,
+    # not MoE expert ownership. Keep EP out of this grid so the language DP
+    # dimension matches the dense/activation batch replicas.
+    language_ep = 1
+    denom = language_tp
     if world_size % denom != 0:
         raise ValueError(
-            f"world_size={world_size} must be divisible by language TP*EP={language_tp}*{language_ep}"
+            f"world_size={world_size} must be divisible by language TP={language_tp}"
         )
     language_dp = world_size // denom
 
