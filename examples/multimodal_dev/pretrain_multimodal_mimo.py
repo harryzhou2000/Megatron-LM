@@ -150,9 +150,7 @@ def _build_module_parallel_context(args):
     language_ep = 1
     denom = language_tp
     if world_size % denom != 0:
-        raise ValueError(
-            f"world_size={world_size} must be divisible by language TP={language_tp}"
-        )
+        raise ValueError(f"world_size={world_size} must be divisible by language TP={language_tp}")
     language_dp = world_size // denom
 
     vision_size = vision_tp * vision_dp
@@ -265,6 +263,54 @@ class Qwen35VLMimoModel(MimoModel):
             modality_inputs=modality_inputs,
         )
         return output
+
+    def _forward_all_modules(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        loss_mask,
+        labels,
+        modality_inputs,
+        packing_kwargs=None,
+    ):
+        """Forward colocated Qwen3.5-VL MIMO while preserving ``input_ids`` for MTP."""
+        if packing_kwargs is not None:
+            raise NotImplementedError(
+                "packing_kwargs is not supported by pretrain_multimodal_mimo yet"
+            )
+
+        modality_embeddings = {}
+        for modality_name, submodule in self.modality_submodules.items():
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
+                and modality_inputs[modality_name] is not None
+            ):
+                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                if embeddings is not None:
+                    modality_embeddings[modality_name] = embeddings
+
+        if self.colocated_comms:
+            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+
+        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        modality_embeddings["text"] = text_embeddings
+        combined_embeddings = self.align_embeddings_by_token_positions(
+            modality_embeddings=modality_embeddings,
+            input_ids=input_ids,
+            special_token_ids=self.special_token_ids,
+        )
+
+        lm_output = self.language_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        return lm_output, loss_mask
 
 
 def _build_qwen35_vl_mimo_model(
