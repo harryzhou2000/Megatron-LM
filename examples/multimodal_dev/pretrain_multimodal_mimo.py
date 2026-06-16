@@ -49,6 +49,7 @@ from examples.multimodal_dev.models.qwen35_vl.specs import (
     get_qwen35_vl_vision_spec,
 )
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
@@ -179,6 +180,7 @@ class Qwen35VLMimoModel(MimoModel):
         video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         spatial_merge_size: int = 2,
+        vision_tp_group=None,
         cp_group=None,
         tp_group=None,
     ) -> None:
@@ -187,6 +189,7 @@ class Qwen35VLMimoModel(MimoModel):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
+        self.vision_tp_group = vision_tp_group
 
     def compute_position_ids(self, input_ids, image_grid_thw=None, packed_seq_params=None):
         """Compute Qwen3.5-VL 3D MRoPE position IDs."""
@@ -281,6 +284,12 @@ class Qwen35VLMimoModel(MimoModel):
             ):
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
+                    if modality_name == "images" and self.vision_tp_group is not None:
+                        embeddings = tensor_parallel.gather_from_sequence_parallel_region(
+                            embeddings,
+                            tensor_parallel_output_grad=True,
+                            group=self.vision_tp_group,
+                        )
                     modality_embeddings[modality_name] = embeddings
 
         if self.colocated_comms:
@@ -383,6 +392,7 @@ def _build_qwen35_vl_mimo_model(
         mimo_config,
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
         spatial_merge_size=spatial_merge_size,
+        vision_tp_group=vision_pg_collection.tp if vision_pg_collection is not None else None,
         cp_group=language_pg_collection.cp if language_pg_collection is not None else None,
         tp_group=language_pg_collection.tp if language_pg_collection is not None else None,
     )
