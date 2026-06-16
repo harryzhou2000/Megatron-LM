@@ -74,12 +74,6 @@ def add_multimodal_mimo_args(parser):
         help="Vision encoder TP size for colocated MIMO. Defaults to global TP size.",
     )
     group.add_argument(
-        "--mimo-vision-data-parallel-size",
-        type=int,
-        default=None,
-        help="Vision encoder DP size for colocated MIMO. Defaults to world_size / vision TP.",
-    )
-    group.add_argument(
         "--mimo-disable-module-grid-map",
         action="store_true",
         default=False,
@@ -137,11 +131,9 @@ def _build_module_parallel_context(args):
     vision_tp = getattr(args, "mimo_vision_tensor_model_parallel_size", None)
     if vision_tp is None:
         vision_tp = args.tensor_model_parallel_size
-    vision_dp = getattr(args, "mimo_vision_data_parallel_size", None)
-    if vision_dp is None:
-        if world_size % vision_tp != 0:
-            raise ValueError(f"world_size={world_size} must be divisible by vision TP={vision_tp}")
-        vision_dp = world_size // vision_tp
+    if world_size % vision_tp != 0:
+        raise ValueError(f"world_size={world_size} must be divisible by vision TP={vision_tp}")
+    vision_dp = world_size // vision_tp
 
     language_tp = args.tensor_model_parallel_size
     # The MIMO grid describes activation/batch layout for the colocated bridge,
