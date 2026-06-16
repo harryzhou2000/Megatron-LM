@@ -304,12 +304,6 @@ class Qwen35VLMimoModel(MimoModel):
             ):
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
-                    if modality_name == "images" and self.vision_tp_group is not None:
-                        embeddings = tensor_parallel.gather_from_sequence_parallel_region(
-                            embeddings,
-                            tensor_parallel_output_grad=True,
-                            group=self.vision_tp_group,
-                        )
                     modality_embeddings[modality_name] = embeddings
 
         if self.colocated_comms:
