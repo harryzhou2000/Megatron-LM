@@ -232,6 +232,9 @@ class Qwen35VLMimoModel(MimoModel):
 
         modality_inputs = None
         if pixel_values is not None:
+            pixel_values, image_grid_thw = self._gather_vision_inputs_for_tp(
+                pixel_values, image_grid_thw
+            )
             modality_inputs = {
                 "images": {
                     "qwen35_vision_encoder": {
@@ -252,6 +255,27 @@ class Qwen35VLMimoModel(MimoModel):
             padding_mask=padding_mask,
         )
         return output
+
+    def _gather_vision_inputs_for_tp(self, pixel_values, image_grid_thw):
+        """Gather local language-DP samples into the colocated vision TP group.
+
+        For colocated fan-out such as vision TP4/DP16 -> language TP1/DP64,
+        the vision side must encode the grouped batch for the four language DP
+        ranks in each vision DP slot.  The colocated bridge then narrows the
+        grouped vision embeddings back to each language rank.
+        """
+        if self.vision_tp_group is None or dist.get_world_size(self.vision_tp_group) == 1:
+            return pixel_values, image_grid_thw
+
+        def _all_gather_first_dim(tensor):
+            tensor = tensor.contiguous()
+            out_shape = list(tensor.shape)
+            out_shape[0] *= dist.get_world_size(self.vision_tp_group)
+            output = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+            dist.all_gather_into_tensor(output, tensor, group=self.vision_tp_group)
+            return output
+
+        return _all_gather_first_dim(pixel_values), _all_gather_first_dim(image_grid_thw)
 
     def _forward_all_modules(
         self,
