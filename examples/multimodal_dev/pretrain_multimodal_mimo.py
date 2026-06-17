@@ -227,6 +227,10 @@ class Qwen35VLMimoModel(MimoModel):
         word_reduce_scatter = getattr(
             embedding_layer.word_embeddings, "reduce_scatter_embeddings", None
         )
+        # MIMO aligns text and vision using the full local token list. Under SP,
+        # RoPE/no-position embeddings may reduce-scatter inside VocabParallelEmbedding
+        # before LanguageModelEmbedding sees the tensor, so disable both wrapper
+        # and child flags only for this lookup. Restore them before GPT/MTP runs.
         if scatter is not None:
             embedding_layer.scatter_to_sequence_parallel = False
         if reduce_scatter is not None:
