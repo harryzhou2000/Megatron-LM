@@ -104,11 +104,24 @@ def _build_module_parallel_context(args):
     if world_size % denom != 0:
         raise ValueError(f"world_size={world_size} must be divisible by language TP={language_tp}")
     language_dp = world_size // denom
-    if vision_tp != language_tp and language_tp != 1:
+    if vision_tp > language_tp and language_tp != 1:
         raise ValueError(
-            "pretrain_multimodal_mimo only supports heterogeneous vision TP when "
+            "pretrain_multimodal_mimo supports vision TP > language TP only when "
             f"language TP is 1; got vision TP={vision_tp}, language TP={language_tp}"
         )
+    if language_tp > vision_tp:
+        if language_tp % vision_tp != 0:
+            raise ValueError(
+                "language TP must be divisible by vision TP for MIMO fan-in; "
+                f"got language TP={language_tp}, vision TP={vision_tp}"
+            )
+        fan_in_scale = language_tp // vision_tp
+        if args.micro_batch_size % fan_in_scale != 0:
+            raise ValueError(
+                "micro_batch_size must be divisible by MIMO fan-in scale when "
+                "language TP > vision TP; "
+                f"micro_batch_size={args.micro_batch_size}, fan_in_scale={fan_in_scale}"
+            )
 
     vision_size = vision_tp * vision_dp
     language_size = language_tp * language_dp * language_ep
@@ -159,6 +172,8 @@ class Qwen35VLMimoModel(MimoModel):
         vision_tp_group=None,
         cp_group=None,
         tp_group=None,
+        vision_grid=None,
+        language_grid=None,
     ) -> None:
         super().__init__(mimo_config, cp_group=cp_group, tp_group=tp_group)
         self.image_token_id = image_token_id
@@ -167,6 +182,8 @@ class Qwen35VLMimoModel(MimoModel):
         self.spatial_merge_size = spatial_merge_size
         self.vision_tp_group = vision_tp_group
         self.language_tp_group = tp_group
+        self.vision_grid = vision_grid
+        self.language_grid = language_grid
 
     def compute_position_ids(self, input_ids, image_grid_thw=None, packed_seq_params=None):
         """Compute Qwen3.5-VL 3D MRoPE position IDs."""
@@ -217,7 +234,7 @@ class Qwen35VLMimoModel(MimoModel):
 
         modality_inputs = None
         if pixel_values is not None:
-            pixel_values, image_grid_thw = self._gather_vision_inputs_for_tp(
+            pixel_values, image_grid_thw = self._prepare_vision_inputs_for_bridge(
                 pixel_values, image_grid_thw, vision_stats
             )
             modality_inputs = {
@@ -293,7 +310,41 @@ class Qwen35VLMimoModel(MimoModel):
             "num_patches": num_patches,
             "num_grid_rows": int(image_grid_thw.shape[0]),
             "num_image_tokens": num_image_tokens,
+            "patch_counts": patch_counts,
+            "sample_grid_ranges": self._sample_grid_ranges(
+                token_counts=token_counts,
+                merged_patch_counts=patch_counts // merge_area,
+            ),
+            "num_samples": int(token_counts.numel()),
         }
+
+    @staticmethod
+    def _sample_grid_ranges(token_counts, merged_patch_counts):
+        """Map each language sample to its contiguous image_grid_thw row range."""
+        # This relies on the dataset collating image_grid_thw in sample-major order.
+        # It matches aggregate visual-token counts, not explicit image occurrence
+        # boundaries in the prompt; malformed/reordered metadata with identical
+        # totals can still map to the wrong sample before later validation fails.
+        ranges = []
+        row = 0
+        for count in token_counts.tolist():
+            start = row
+            remaining = int(count)
+            while remaining > 0 and row < merged_patch_counts.numel():
+                remaining -= int(merged_patch_counts[row].item())
+                row += 1
+            if remaining != 0:
+                raise ValueError(
+                    "Could not map image tokens to contiguous image_grid_thw rows; "
+                    f"remaining tokens for sample={remaining}"
+                )
+            ranges.append((start, row))
+        if row != merged_patch_counts.numel():
+            raise ValueError(
+                "image_grid_thw contains rows that were not consumed by input_ids image tokens: "
+                f"consumed_rows={row}, total_rows={merged_patch_counts.numel()}"
+            )
+        return ranges
 
     def _image_token_counts_per_sample(self, input_ids, packed_seq_params=None):
         """Return image-token counts per local sample for BSHD or packed THD input."""
@@ -312,14 +363,58 @@ class Qwen35VLMimoModel(MimoModel):
             raise ValueError(f"input_ids must have shape [B, S], got {tuple(input_ids.shape)}")
         return (input_ids == self.image_token_id).sum(dim=1).to(torch.long)
 
-    def _gather_vision_inputs_for_tp(self, pixel_values, image_grid_thw, vision_stats):
-        """Gather local language-DP samples into the colocated vision TP group.
+    def _prepare_vision_inputs_for_bridge(self, pixel_values, image_grid_thw, vision_stats):
+        """Redistribute local visual tensors for the colocated bridge.
 
-        For colocated fan-out such as vision TP4/DP16 -> language TP1/DP64,
-        the vision side must encode the grouped batch for the four language DP
-        ranks in each vision DP slot.  The colocated bridge then narrows the
-        grouped vision embeddings back to each language rank.
+        The full language MBS stays local. For vision-DP fan-in
+        (language_tp > vision_tp), each vision DP slot encodes one MBS shard.
+        For fan-out (vision_tp > language_tp), vision TP peers encode a grouped
+        batch and the bridge narrows it back to language DP ranks.
         """
+        if self.vision_grid is None or self.language_grid is None:
+            return pixel_values, image_grid_thw
+
+        vision_dp_size = self._grid_dim_size(self.vision_grid, "dp")
+        language_dp_size = self._grid_dim_size(self.language_grid, "dp")
+        if vision_dp_size == language_dp_size:
+            return pixel_values, image_grid_thw
+        if vision_dp_size > language_dp_size:
+            return self._slice_vision_inputs_for_fan_in(pixel_values, image_grid_thw, vision_stats)
+        return self._gather_vision_inputs_for_fan_out(pixel_values, image_grid_thw, vision_stats)
+
+    def _slice_vision_inputs_for_fan_in(self, pixel_values, image_grid_thw, vision_stats):
+        """Give each vision DP slot its shard of the local language MBS."""
+        vision_dp_size = self._grid_dim_size(self.vision_grid, "dp")
+        language_dp_size = self._grid_dim_size(self.language_grid, "dp")
+        if vision_dp_size % language_dp_size != 0:
+            raise ValueError(
+                "vision DP must be divisible by language DP for MIMO fan-in; "
+                f"got vision DP={vision_dp_size}, language DP={language_dp_size}"
+            )
+        scale = vision_dp_size // language_dp_size
+        num_samples = vision_stats["num_samples"]
+        if num_samples % scale != 0:
+            raise ValueError(
+                "micro batch size must be divisible by MIMO fan-in scale; "
+                f"num_samples={num_samples}, fan_in_scale={scale}"
+            )
+
+        vision_dp_idx = self._grid_dp_index(self.vision_grid)
+        slot = vision_dp_idx % scale
+        samples_per_slot = num_samples // scale
+        sample_start = slot * samples_per_slot
+        sample_end = sample_start + samples_per_slot
+
+        sample_ranges = vision_stats["sample_grid_ranges"]
+        row_start = sample_ranges[sample_start][0]
+        row_end = sample_ranges[sample_end - 1][1]
+        patch_counts = vision_stats["patch_counts"]
+        patch_start = int(patch_counts[:row_start].sum().item())
+        patch_end = int(patch_counts[:row_end].sum().item())
+        return pixel_values[patch_start:patch_end], image_grid_thw[row_start:row_end]
+
+    def _gather_vision_inputs_for_fan_out(self, pixel_values, image_grid_thw, vision_stats):
+        """Gather local language-DP samples into the colocated vision TP group."""
         vision_tp_size = (
             dist.get_world_size(self.vision_tp_group) if self.vision_tp_group is not None else 1
         )
@@ -364,6 +459,18 @@ class Qwen35VLMimoModel(MimoModel):
             return output
 
         return _all_gather_first_dim(pixel_values), _all_gather_first_dim(image_grid_thw)
+
+    @staticmethod
+    def _grid_dim_size(grid, dim_name):
+        return grid.shape[grid.dim_names.index(dim_name)]
+
+    @staticmethod
+    def _grid_dp_index(grid):
+        rank = dist.get_rank()
+        for dp_idx, tp_group in enumerate(grid.get_rank_enum(["tp"])):
+            if rank in tp_group:
+                return dp_idx
+        raise RuntimeError(f"rank {rank} is not in grid rank span")
 
     def _forward_all_modules(
         self,
@@ -531,6 +638,10 @@ def _build_qwen35_vl_mimo_model(
         vision_tp_group=vision_pg_collection.tp if vision_pg_collection is not None else None,
         cp_group=language_pg_collection.cp if language_pg_collection is not None else None,
         tp_group=language_pg_collection.tp if language_pg_collection is not None else None,
+        vision_grid=module_to_grid_map["images"] if module_to_grid_map is not None else None,
+        language_grid=(
+            module_to_grid_map[MIMO_LANGUAGE_MODULE_KEY] if module_to_grid_map is not None else None
+        ),
     )
 
 
