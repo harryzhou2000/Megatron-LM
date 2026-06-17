@@ -507,7 +507,6 @@ try:
 except ImportError:
     HAVE_HYBRIDEP = False
     HAVE_HYBRIDEP_DENSE_ROUTING = False
-# HAVE_HYBRIDEP_DENSE_ROUTING = False
 _hybrid_ep_buffer = None
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.

@@ -1163,15 +1163,18 @@ class _HybridEPManager(_DispatchManager):
                 )
                 _DEBUG_DENSE_ROUTING_HYBRIDEP_METADATA_PRINTED = True
         elif HAVE_HYBRIDEP_DENSE_ROUTING and self.config.moe_hybridep_use_dense_routing_map:
-            _, self.topk_idx = torch.topk(
-                self.token_probs, self.router_topk, dim=-1
-            )
-            self.topk_idx = self.topk_idx.to(torch.int16)
-            if self.capacity_factor is not None:
-                mask = self.token_probs.gather(1, self.topk_idx.long()) == 0
-                self.topk_idx = self.topk_idx.masked_fill(mask, -1)
-            if padded_num_tokens > num_tokens:
-                self.topk_idx[num_tokens:padded_num_tokens] = -1
+            if self.num_experts > _HYBRIDEP_INT16_EXPERT_LIMIT:
+                self.topk_idx = None
+            else:
+                _, self.topk_idx = torch.topk(
+                    self.token_probs, self.router_topk, dim=-1
+                )
+                self.topk_idx = self.topk_idx.to(torch.int16)
+                if self.capacity_factor is not None:
+                    mask = self.token_probs.gather(1, self.topk_idx.long()) == 0
+                    self.topk_idx = self.topk_idx.masked_fill(mask, -1)
+                if padded_num_tokens > num_tokens:
+                    self.topk_idx[num_tokens:padded_num_tokens] = -1
         else:
             self.topk_idx = None
 
