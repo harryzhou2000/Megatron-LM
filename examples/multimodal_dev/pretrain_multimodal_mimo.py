@@ -27,6 +27,7 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from examples.mimo.training.topology import ModuleGridSpec, create_topology
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import get_batch, loss_func
 from examples.multimodal_dev.models.base import MultimodalModel
@@ -51,13 +52,11 @@ from examples.multimodal_dev.models.qwen35_vl.specs import (
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -83,46 +82,6 @@ def add_multimodal_mimo_args(parser):
     return parser
 
 
-def _create_mimo_grid(tp: int, dp: int, ep: int = 1) -> HyperCommGrid:
-    """Create a colocated MIMO HyperCommGrid and required process groups."""
-    grid = HyperCommGrid(
-        shape=[tp, 1, 1, dp, ep, 1],
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
-        rank_offset=0,
-        backend="nccl",
-    )
-    grid.create_pg(["tp"])
-    grid.create_pg(["cp"])
-    grid.create_pg(["pp"])
-    grid.create_pg(["dp"])
-    grid.create_pg(["dp", "cp"])
-    grid.create_pg(["tp", "cp"])
-    grid.create_pg(["ep"])
-    grid.create_pg(["expt_dp"])
-    grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
-    return grid
-
-
-def _pg_collection_from_grid(grid: HyperCommGrid) -> ProcessGroupCollection:
-    """Build a ProcessGroupCollection from a MIMO HyperCommGrid."""
-    pg = ProcessGroupCollection()
-    pg.tp = grid.get_pg("tp")
-    pg.cp = grid.get_pg("cp")
-    pg.pp = grid.get_pg("pp")
-    pg.dp = grid.get_pg("dp")
-    pg.dp_cp = grid.get_pg(["dp", "cp"])
-    pg.ep = grid.get_pg("ep")
-    pg.tp_cp = grid.get_pg(["tp", "cp"])
-    pg.expt_dp = grid.get_pg("expt_dp")
-    pg.mp = grid.get_pg(["tp", "pp"])
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
-    return pg
-
-
 def _build_module_parallel_context(args):
     """Build colocated MIMO grids and process-group collections."""
     if getattr(args, "mimo_disable_module_grid_map", False):
@@ -145,6 +104,11 @@ def _build_module_parallel_context(args):
     if world_size % denom != 0:
         raise ValueError(f"world_size={world_size} must be divisible by language TP={language_tp}")
     language_dp = world_size // denom
+    if vision_tp != language_tp and language_tp != 1:
+        raise ValueError(
+            "pretrain_multimodal_mimo only supports heterogeneous vision TP when "
+            f"language TP is 1; got vision TP={vision_tp}, language TP={language_tp}"
+        )
 
     vision_size = vision_tp * vision_dp
     language_size = language_tp * language_dp * language_ep
@@ -156,13 +120,25 @@ def _build_module_parallel_context(args):
             f"world_size={world_size}."
         )
 
-    vision_grid = _create_mimo_grid(tp=vision_tp, dp=vision_dp, ep=1)
-    language_grid = _create_mimo_grid(tp=language_tp, dp=language_dp, ep=language_ep)
-    module_to_grid_map = {"images": vision_grid, MIMO_LANGUAGE_MODULE_KEY: language_grid}
+    topology = create_topology(
+        [
+            ModuleGridSpec(name="images", num_ranks=world_size, tp=vision_tp),
+            ModuleGridSpec(
+                name=MIMO_LANGUAGE_MODULE_KEY,
+                num_ranks=world_size,
+                tp=language_tp,
+                ep=language_ep,
+            ),
+        ]
+    )
+    module_to_grid_map = {
+        "images": topology.grids["images"],
+        MIMO_LANGUAGE_MODULE_KEY: topology.grids[MIMO_LANGUAGE_MODULE_KEY],
+    }
     return (
         module_to_grid_map,
-        _pg_collection_from_grid(vision_grid),
-        _pg_collection_from_grid(language_grid),
+        topology.module_pgs["images"],
+        topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
     )
 
 
@@ -190,6 +166,7 @@ class Qwen35VLMimoModel(MimoModel):
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
         self.vision_tp_group = vision_tp_group
+        self.language_tp_group = tp_group
 
     def compute_position_ids(self, input_ids, image_grid_thw=None, packed_seq_params=None):
         """Compute Qwen3.5-VL 3D MRoPE position IDs."""
@@ -223,6 +200,14 @@ class Qwen35VLMimoModel(MimoModel):
             raise NotImplementedError(
                 "decoder_input is not supported by pretrain_multimodal_mimo yet"
             )
+        vision_stats = None
+        if pixel_values is not None:
+            vision_stats = self._validate_vision_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -233,7 +218,7 @@ class Qwen35VLMimoModel(MimoModel):
         modality_inputs = None
         if pixel_values is not None:
             pixel_values, image_grid_thw = self._gather_vision_inputs_for_tp(
-                pixel_values, image_grid_thw
+                pixel_values, image_grid_thw, vision_stats
             )
             modality_inputs = {
                 "images": {
@@ -256,7 +241,78 @@ class Qwen35VLMimoModel(MimoModel):
         )
         return output
 
-    def _gather_vision_inputs_for_tp(self, pixel_values, image_grid_thw):
+    def _validate_vision_inputs(
+        self, input_ids, pixel_values, image_grid_thw, packed_seq_params=None
+    ):
+        """Validate Qwen vision tensors before MIMO bridge fan-out."""
+        if image_grid_thw is None:
+            raise ValueError("image_grid_thw must be provided when pixel_values is provided")
+        if image_grid_thw.dim() != 2 or image_grid_thw.size(-1) != 3:
+            raise ValueError(
+                "image_grid_thw must have shape [num_images_or_videos, 3], "
+                f"got {tuple(image_grid_thw.shape)}"
+            )
+        if image_grid_thw.numel() == 0:
+            raise ValueError("image_grid_thw must contain at least one visual item")
+        if pixel_values.dim() == 0:
+            raise ValueError("pixel_values must have at least one dimension")
+        if (image_grid_thw <= 0).any().item():
+            raise ValueError("image_grid_thw entries must be positive")
+
+        patch_counts = image_grid_thw.to(torch.long).prod(dim=1)
+        num_patches = int(patch_counts.sum().item())
+        if pixel_values.shape[0] != num_patches:
+            raise ValueError(
+                "pixel_values first dimension must match sum(T*H*W) from image_grid_thw: "
+                f"pixel_values.shape[0]={pixel_values.shape[0]}, sum_grid={num_patches}"
+            )
+
+        merge_area = self.spatial_merge_size * self.spatial_merge_size
+        if (patch_counts % merge_area != 0).any().item():
+            raise ValueError(
+                "Each visual grid T*H*W must be divisible by "
+                f"spatial_merge_size^2={merge_area}; got {patch_counts.tolist()}"
+            )
+
+        num_visual_tokens = int((patch_counts // merge_area).sum().item())
+        token_counts = self._image_token_counts_per_sample(input_ids, packed_seq_params)
+        num_image_tokens = int(token_counts.sum().item())
+        if num_image_tokens != num_visual_tokens:
+            raise ValueError(
+                "Number of image tokens must match post-merge visual tokens: "
+                f"image_tokens={num_image_tokens}, visual_tokens={num_visual_tokens}"
+            )
+        if token_counts.numel() > 1 and token_counts.unique().numel() != 1:
+            raise ValueError(
+                "pretrain_multimodal_mimo currently requires a uniform number of image "
+                "tokens per sample because the colocated bridge equal-slices flattened "
+                f"visual embeddings; got per-sample counts={token_counts.tolist()}"
+            )
+
+        return {
+            "num_patches": num_patches,
+            "num_grid_rows": int(image_grid_thw.shape[0]),
+            "num_image_tokens": num_image_tokens,
+        }
+
+    def _image_token_counts_per_sample(self, input_ids, packed_seq_params=None):
+        """Return image-token counts per local sample for BSHD or packed THD input."""
+        if packed_seq_params is not None:
+            flat = input_ids.reshape(-1)
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded.to(device=flat.device)
+            counts = [
+                (
+                    flat[int(cu_seqlens[i].item()) : int(cu_seqlens[i + 1].item())]
+                    == self.image_token_id
+                ).sum()
+                for i in range(cu_seqlens.numel() - 1)
+            ]
+            return torch.stack(counts).to(torch.long) if counts else flat.new_zeros(0).long()
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must have shape [B, S], got {tuple(input_ids.shape)}")
+        return (input_ids == self.image_token_id).sum(dim=1).to(torch.long)
+
+    def _gather_vision_inputs_for_tp(self, pixel_values, image_grid_thw, vision_stats):
         """Gather local language-DP samples into the colocated vision TP group.
 
         For colocated fan-out such as vision TP4/DP16 -> language TP1/DP64,
@@ -264,8 +320,40 @@ class Qwen35VLMimoModel(MimoModel):
         ranks in each vision DP slot.  The colocated bridge then narrows the
         grouped vision embeddings back to each language rank.
         """
-        if self.vision_tp_group is None or dist.get_world_size(self.vision_tp_group) == 1:
+        vision_tp_size = (
+            dist.get_world_size(self.vision_tp_group) if self.vision_tp_group is not None else 1
+        )
+        language_tp_size = (
+            dist.get_world_size(self.language_tp_group) if self.language_tp_group is not None else 1
+        )
+        if vision_tp_size == 1 or vision_tp_size == language_tp_size:
             return pixel_values, image_grid_thw
+        if language_tp_size != 1:
+            raise ValueError(
+                "pretrain_multimodal_mimo only supports heterogeneous vision TP when "
+                f"language TP is 1; got vision TP={vision_tp_size}, language TP={language_tp_size}"
+            )
+
+        local_stats = torch.tensor(
+            [
+                vision_stats["num_patches"],
+                vision_stats["num_grid_rows"],
+                vision_stats["num_image_tokens"],
+            ],
+            dtype=torch.long,
+            device=pixel_values.device,
+        )
+        gathered_stats = torch.empty(
+            (vision_tp_size, local_stats.numel()), dtype=torch.long, device=pixel_values.device
+        )
+        dist.all_gather_into_tensor(gathered_stats, local_stats, group=self.vision_tp_group)
+        if not torch.equal(gathered_stats, gathered_stats[0].expand_as(gathered_stats)):
+            raise ValueError(
+                "pretrain_multimodal_mimo requires uniform visual tensor sizes across "
+                "the vision TP gather group because it uses all_gather_into_tensor and "
+                "equal bridge fan-out; got per-rank [patches, grid_rows, image_tokens]="
+                f"{gathered_stats.cpu().tolist()}"
+            )
 
         def _all_gather_first_dim(tensor):
             tensor = tensor.contiguous()
@@ -309,6 +397,8 @@ class Qwen35VLMimoModel(MimoModel):
         if self.colocated_comms:
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
+        self._validate_image_embedding_count(input_ids, modality_embeddings)
+
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
         modality_embeddings["text"] = text_embeddings
         combined_embeddings = self.align_embeddings_by_token_positions(
@@ -317,17 +407,12 @@ class Qwen35VLMimoModel(MimoModel):
             special_token_ids=self.special_token_ids,
         )
 
-        if self.partition_adapter is not None:
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-            combined_embeddings, labels, loss_mask, _, packed_seq_params = self.partition_adapter.shard(
-                embeddings=combined_embeddings,
-                labels=labels,
-                loss_mask=loss_mask,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
-            )
-            if combined_embeddings is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+        combined_embeddings, labels, loss_mask, packed_seq_params = self._shard_language_inputs(
+            embeddings=combined_embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
 
         if padding_mask is not None and self.config.sequence_parallel:
             padding_mask = (
@@ -349,6 +434,20 @@ class Qwen35VLMimoModel(MimoModel):
             packed_seq_params=packed_seq_params,
         )
         return lm_output, loss_mask
+
+    def _validate_image_embedding_count(self, input_ids, modality_embeddings):
+        """Fail early when visual embeddings cannot align to local image tokens."""
+        num_image_tokens = int((input_ids == self.image_token_id).sum().item())
+        image_embeddings = modality_embeddings.get("images")
+        if num_image_tokens and image_embeddings is None:
+            raise ValueError(
+                f"input_ids contain {num_image_tokens} image tokens but no image embeddings were produced"
+            )
+        if image_embeddings is not None and image_embeddings.size(0) != num_image_tokens:
+            raise ValueError(
+                "Number of image tokens does not match bridged image embeddings: "
+                f"image_tokens={num_image_tokens}, image_embeddings={image_embeddings.size(0)}"
+            )
 
 
 def _build_qwen35_vl_mimo_model(
