@@ -21,17 +21,30 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def _apply_rope_fp32(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=False,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
     with ``apply_rotary_pos_emb_in_fp32=True``.
     """
+    from megatron.core import parallel_state
     from megatron.core.models.common.embeddings import rope_utils
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
     orig_dtype = t.dtype
+    if cu_seqlens is not None and cp_group is None:
+        cp_group = parallel_state.get_context_parallel_group()
+
     if (
         cu_seqlens is not None
         and getattr(config, "apply_rope_fusion", False)
@@ -65,9 +78,13 @@ def _apply_rope_fp32(
                 cp_size=cp_group.size(),
                 cp_rank=cp_group.rank(),
                 fp32_compute=True,
-            )
+            ).to(orig_dtype)
 
     t_fp32 = t.float()
+    # Qwen vision supplies one exact RoPE frequency row per packed patch token.
+    # In static THD mode max_seqlen may equal the padded bucket length, so shape
+    # comparisons against max_seqlen are not reliable for detecting this layout.
+    start_positions = cu_seqlens[:-1] if cu_seqlens is not None else None
     out = apply_rotary_pos_emb(
         t_fp32,
         freqs,
@@ -75,14 +92,26 @@ def _apply_rope_fp32(
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=cp_group,
-        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
         max_seqlen=max_seqlen,
+        start_positions=start_positions,
     )
     return out.to(orig_dtype)
 
 
 def _apply_rope_fp32_no_cp(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=False,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
@@ -101,6 +130,9 @@ def _apply_rope_fp32_no_cp(
             cu_seqlens,
             mscale,
             cp_group=_NO_CP_GROUP,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
         )
     finally:
