@@ -622,6 +622,7 @@ def _build_qwen35_vl_mimo_model(
             "rotary_percent": ROTARY_PERCENT,
             "rotary_base": ROTARY_BASE,
             "mtp_block_spec": mtp_block_spec,
+            "scatter_embedding_sequence_parallel": False,
         },
     )
 
