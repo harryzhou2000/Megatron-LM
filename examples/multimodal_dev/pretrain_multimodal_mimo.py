@@ -223,13 +223,25 @@ class Qwen35VLMimoModel(MimoModel):
 
         embedding_layer = unwrap_model(self.language_model).embedding
         scatter = getattr(embedding_layer, "scatter_to_sequence_parallel", None)
+        reduce_scatter = getattr(embedding_layer, "reduce_scatter_embeddings", None)
+        word_reduce_scatter = getattr(
+            embedding_layer.word_embeddings, "reduce_scatter_embeddings", None
+        )
         if scatter is not None:
             embedding_layer.scatter_to_sequence_parallel = False
+        if reduce_scatter is not None:
+            embedding_layer.reduce_scatter_embeddings = False
+        if word_reduce_scatter is not None:
+            embedding_layer.word_embeddings.reduce_scatter_embeddings = False
         try:
             return embedding_layer(input_ids=input_ids_text, position_ids=position_ids_text).squeeze(1)
         finally:
             if scatter is not None:
                 embedding_layer.scatter_to_sequence_parallel = scatter
+            if reduce_scatter is not None:
+                embedding_layer.reduce_scatter_embeddings = reduce_scatter
+            if word_reduce_scatter is not None:
+                embedding_layer.word_embeddings.reduce_scatter_embeddings = word_reduce_scatter
 
     def forward(
         self,
