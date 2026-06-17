@@ -58,6 +58,7 @@ from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.utils import unwrap_model
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -197,6 +198,38 @@ class Qwen35VLMimoModel(MimoModel):
             packed_seq_params=packed_seq_params,
         )
         return position_ids
+
+    def get_text_embeddings(self, input_ids, position_ids, special_token_ids):
+        """Get full text embeddings before MIMO performs multimodal alignment.
+
+        GPT embeddings should normally scatter under SP so MTP receives SP-local
+        next-token embeddings. MIMO alignment needs the opposite: a full flat
+        text-token list. Temporarily disable only this lookup's scatter and
+        restore the embedding module state before the language model/MTP forward.
+        """
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+
+        batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
+        input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
+
+        if position_ids is None:
+            position_ids_text = None
+        elif position_ids.dim() == 3:
+            position_ids_text = position_ids[0, batch_idx, seq_idx].unsqueeze(0)
+        else:
+            position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)
+
+        embedding_layer = unwrap_model(self.language_model).embedding
+        scatter = getattr(embedding_layer, "scatter_to_sequence_parallel", None)
+        if scatter is not None:
+            embedding_layer.scatter_to_sequence_parallel = False
+        try:
+            return embedding_layer(input_ids=input_ids_text, position_ids=position_ids_text).squeeze(1)
+        finally:
+            if scatter is not None:
+                embedding_layer.scatter_to_sequence_parallel = scatter
 
     def forward(
         self,
@@ -622,7 +655,6 @@ def _build_qwen35_vl_mimo_model(
             "rotary_percent": ROTARY_PERCENT,
             "rotary_base": ROTARY_BASE,
             "mtp_block_spec": mtp_block_spec,
-            "scatter_embedding_sequence_parallel": False,
         },
     )
 
