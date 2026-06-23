@@ -40,6 +40,46 @@ def add_multimodal_args(parser):
         help="Image size (height and width) for mock data",
     )
     group.add_argument(
+        "--mock-variable-images",
+        action="store_true",
+        default=False,
+        help="Generate variable image counts and image sizes in mock Qwen-VL data.",
+    )
+    group.add_argument(
+        "--mock-min-images-per-sample",
+        type=int,
+        default=1,
+        help="Minimum images per sample when --mock-variable-images is enabled.",
+    )
+    group.add_argument(
+        "--mock-max-images-per-sample",
+        type=int,
+        default=3,
+        help="Maximum images per sample when --mock-variable-images is enabled.",
+    )
+    group.add_argument(
+        "--mock-image-size-choices",
+        type=str,
+        default="224,448",
+        help="Comma-separated square image sizes for variable mock images.",
+    )
+    group.add_argument(
+        "--mock-image-count-weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated weights for image counts in "
+            "[mock_min_images_per_sample, mock_max_images_per_sample]. "
+            "For 0-1 with zeros more common, use e.g. '4,1'."
+        ),
+    )
+    group.add_argument(
+        "--mock-random-seed",
+        type=int,
+        default=1234,
+        help="Base seed for deterministic per-sample mock data generation.",
+    )
+    group.add_argument(
         "--total-seq-length",
         type=int,
         default=1024,
