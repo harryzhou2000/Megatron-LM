@@ -266,6 +266,8 @@ class Qwen35VLMimoModel(MimoModel):
             raise NotImplementedError(
                 "decoder_input is not supported by pretrain_multimodal_mimo yet"
             )
+        if (input_ids == self.video_token_id).any().item():
+            raise ValueError("pretrain_multimodal_mimo currently supports image tokens only")
         vision_stats = None
         if pixel_values is not None:
             vision_stats = self._validate_vision_inputs(
@@ -570,6 +572,16 @@ class Qwen35VLMimoModel(MimoModel):
             packed_seq_params=packed_seq_params,
         )
 
+        lm_input_ids = input_ids
+        lm_position_ids = position_ids
+        if self.config.sequence_parallel:
+            if packed_seq_params is not None:
+                raise NotImplementedError(
+                    "pretrain_multimodal_mimo does not support packed sequence with "
+                    "sequence_parallel yet because packed metadata remains global"
+                )
+            lm_input_ids = self._sp_shard_batch_sequence(input_ids)
+            lm_position_ids = self._sp_shard_position_ids(position_ids)
         if padding_mask is not None and self.config.sequence_parallel:
             padding_mask = (
                 tensor_parallel.scatter_to_sequence_parallel_region(
@@ -580,8 +592,8 @@ class Qwen35VLMimoModel(MimoModel):
             )
 
         lm_output = self.language_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
+            input_ids=lm_input_ids,
+            position_ids=lm_position_ids,
             attention_mask=attention_mask,
             decoder_input=combined_embeddings,
             labels=labels,
@@ -590,6 +602,30 @@ class Qwen35VLMimoModel(MimoModel):
             packed_seq_params=packed_seq_params,
         )
         return lm_output, loss_mask
+
+    def _sp_shard_batch_sequence(self, tensor):
+        """Shard a [B, S] tensor along S using the language TP/SP group."""
+        return (
+            tensor_parallel.scatter_to_sequence_parallel_region(
+                tensor.transpose(0, 1).contiguous(), group=self.language_model.tp_group
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    def _sp_shard_position_ids(self, position_ids):
+        """Shard Qwen MRoPE position IDs to match SP-local decoder input."""
+        if position_ids is None:
+            return None
+        if position_ids.dim() == 3:
+            return (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    position_ids.permute(2, 0, 1).contiguous(), group=self.language_model.tp_group
+                )
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+        return self._sp_shard_batch_sequence(position_ids)
 
     def _validate_image_embedding_count(self, input_ids, modality_embeddings):
         """Fail early when visual embeddings cannot align to local image tokens."""
