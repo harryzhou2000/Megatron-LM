@@ -237,6 +237,7 @@ class Qwen35VLMimoModel(MimoModel):
         cp_group=None,
         tp_group=None,
         vision_dp_group=None,
+        language_dp_group=None,
         vision_mdp_enabled: bool = False,
         vision_mdp_scheduler: str = "lpt",
         vision_mdp_cost_proxy: str = "p2",
@@ -251,6 +252,7 @@ class Qwen35VLMimoModel(MimoModel):
         self.vision_tp_group = vision_tp_group
         self.language_tp_group = tp_group
         self.vision_dp_group = vision_dp_group
+        self.language_dp_group = language_dp_group
         self.vision_mdp_enabled = vision_mdp_enabled
         self.vision_mdp_scheduler = vision_mdp_scheduler
         self.vision_mdp_cost_proxy = vision_mdp_cost_proxy
@@ -333,6 +335,14 @@ class Qwen35VLMimoModel(MimoModel):
         **kwargs,
     ):
         """Adapt multimodal_dev batches to MIMO's ``modality_inputs`` format."""
+        self._debug_mdp_stage(
+            "forward_start",
+            pixel_is_none=pixel_values is None,
+            pixel_shape=None if pixel_values is None else tuple(pixel_values.shape),
+            grid_is_none=image_grid_thw is None,
+            grid_shape=None if image_grid_thw is None else tuple(image_grid_thw.shape),
+            mdp=self.vision_mdp_enabled,
+        )
         if decoder_input is not None:
             raise NotImplementedError(
                 "decoder_input is not supported by pretrain_multimodal_mimo yet"
@@ -340,16 +350,27 @@ class Qwen35VLMimoModel(MimoModel):
         if (input_ids == self.video_token_id).any().item():
             raise ValueError("pretrain_multimodal_mimo currently supports image tokens only")
         if self.vision_mdp_enabled:
+            self._debug_mdp_stage("before_normalize_visual_inputs")
             pixel_values, image_grid_thw = self._normalize_mdp_visual_inputs(
                 pixel_values, image_grid_thw, device=input_ids.device
             )
+            self._debug_mdp_stage(
+                "after_normalize_visual_inputs",
+                pixel_shape=tuple(pixel_values.shape),
+                grid_shape=tuple(image_grid_thw.shape),
+            )
         vision_stats = None
         if pixel_values is not None:
+            self._debug_mdp_stage("before_validate_vision_inputs")
             vision_stats = self._validate_vision_inputs(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 packed_seq_params=packed_seq_params,
+            )
+            self._debug_mdp_stage(
+                "after_validate_vision_inputs",
+                stats={k: v for k, v in vision_stats.items() if not torch.is_tensor(v)},
             )
         if position_ids is None:
             position_ids = self.compute_position_ids(
@@ -359,8 +380,26 @@ class Qwen35VLMimoModel(MimoModel):
             )
 
         modality_inputs = None
+        image_bridge_split_sizes = None
         if pixel_values is not None:
-            if self.vision_mdp_enabled:
+            if (
+                vision_stats is not None
+                and vision_stats["num_image_tokens"] == 0
+                and not self._uses_colocated_bridge_for_visuals()
+                and not (self.vision_mdp_enabled and self._can_use_mdp_scheduler())
+            ):
+                image_embeddings = torch.empty(
+                    (0, self.config.hidden_size), dtype=pixel_values.dtype, device=pixel_values.device
+                )
+                modality_inputs = {"images": {"precomputed_embeddings": image_embeddings}}
+            elif self.vision_mdp_enabled and self._can_use_mdp_scheduler():
+                self._debug_mdp_stage(
+                    "before_encode_images_with_mdp",
+                    schedule_group_size=dist.get_world_size(self._mdp_schedule_group()),
+                    schedule_group_rank=dist.get_rank(self._mdp_schedule_group()),
+                    num_workers=self._mdp_num_workers(),
+                    worker_rank=self._mdp_worker_rank(),
+                )
                 image_embeddings = self._encode_images_with_mdp(
                     pixel_values,
                     image_grid_thw,
@@ -369,17 +408,27 @@ class Qwen35VLMimoModel(MimoModel):
                 )
                 modality_inputs = {"images": {"precomputed_embeddings": image_embeddings}}
             else:
-                pixel_values, image_grid_thw = self._prepare_vision_inputs_for_bridge(
-                    pixel_values, image_grid_thw, vision_stats
+                pixel_values, image_grid_thw, image_bridge_split_sizes = (
+                    self._prepare_vision_inputs_for_bridge(
+                        pixel_values, image_grid_thw, vision_stats
+                    )
                 )
-                modality_inputs = {
-                    "images": {
-                        "qwen35_vision_encoder": {
-                            "pixel_values": pixel_values,
-                            "grid_thw": image_grid_thw,
+                if image_bridge_split_sizes is not None and sum(image_bridge_split_sizes) == 0:
+                    image_embeddings = torch.empty(
+                        (0, self.config.hidden_size),
+                        dtype=pixel_values.dtype,
+                        device=pixel_values.device,
+                    )
+                    modality_inputs = {"images": {"precomputed_embeddings": image_embeddings}}
+                else:
+                    modality_inputs = {
+                        "images": {
+                            "qwen35_vision_encoder": {
+                                "pixel_values": pixel_values,
+                                "grid_thw": image_grid_thw,
+                            }
                         }
                     }
-                }
 
         output, _ = self._forward_all_modules(
             input_ids=input_ids,
@@ -388,10 +437,17 @@ class Qwen35VLMimoModel(MimoModel):
             loss_mask=loss_mask,
             labels=labels,
             modality_inputs=modality_inputs,
+            image_bridge_split_sizes=image_bridge_split_sizes,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
         return output
+
+    def _debug_mdp_stage(self, stage, **kwargs):
+        if os.getenv("MIMO_MDP_DEBUG", "0") != "1":
+            return
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        print(f"[MIMO MDP][rank {rank}] {stage} {kwargs}", flush=True)
 
     def _validate_vision_inputs(
         self, input_ids, pixel_values, image_grid_thw, packed_seq_params=None
@@ -452,6 +508,7 @@ class Qwen35VLMimoModel(MimoModel):
             )
         if (
             not self.vision_mdp_enabled
+            and self._needs_uniform_visual_token_counts_for_bridge()
             and token_counts.numel() > 1
             and token_counts.unique().numel() != 1
         ):
@@ -519,6 +576,24 @@ class Qwen35VLMimoModel(MimoModel):
             raise ValueError(f"input_ids must have shape [B, S], got {tuple(input_ids.shape)}")
         return (input_ids == self.image_token_id).sum(dim=1).to(torch.long)
 
+    def _uses_colocated_bridge_for_visuals(self):
+        if self.vision_grid is None or self.language_grid is None:
+            return False
+        if self.vision_mdp_enabled and self._can_use_mdp_scheduler():
+            return False
+        return self._grid_dim_size(self.vision_grid, "dp") != self._grid_dim_size(
+            self.language_grid, "dp"
+        )
+
+    def _needs_uniform_visual_token_counts_for_bridge(self):
+        if self.vision_grid is None or self.language_grid is None:
+            return True
+        vision_dp_size = self._grid_dim_size(self.vision_grid, "dp")
+        language_dp_size = self._grid_dim_size(self.language_grid, "dp")
+        # Equal-DP needs no slicing and fan-out has variable split sizes. Fan-in
+        # still uses equal all-gather, so keep the conservative uniform check.
+        return vision_dp_size > language_dp_size
+
     def _prepare_vision_inputs_for_bridge(self, pixel_values, image_grid_thw, vision_stats):
         """Redistribute local visual tensors for the colocated bridge.
 
@@ -528,22 +603,37 @@ class Qwen35VLMimoModel(MimoModel):
         batch and the bridge narrows it back to language DP ranks.
         """
         if self.vision_grid is None or self.language_grid is None:
-            return pixel_values, image_grid_thw
+            return pixel_values, image_grid_thw, None
 
         vision_dp_size = self._grid_dim_size(self.vision_grid, "dp")
         language_dp_size = self._grid_dim_size(self.language_grid, "dp")
         if vision_dp_size == language_dp_size:
-            return pixel_values, image_grid_thw
+            return pixel_values, image_grid_thw, None
         if vision_dp_size > language_dp_size:
-            return self._slice_vision_inputs_for_fan_in(pixel_values, image_grid_thw, vision_stats)
+            pixel_values, image_grid_thw = self._slice_vision_inputs_for_fan_in(
+                pixel_values, image_grid_thw, vision_stats
+            )
+            return pixel_values, image_grid_thw, None
         return self._gather_vision_inputs_for_fan_out(pixel_values, image_grid_thw, vision_stats)
 
     def _encode_images_with_mdp(self, pixel_values, image_grid_thw, vision_stats, packed=False):
         """Schedule variable-size images across the vision DP group and restore local order."""
+        self._debug_mdp_stage("mdp_encode_start")
         self._validate_mdp_layout(packed=packed)
+        schedule_group = self._mdp_schedule_group()
         local_descs = self._local_visual_descriptors(vision_stats)
-        gathered_pixels = self._all_gather_variable_first_dim(pixel_values, self.vision_dp_group)
-        gathered_grids = self._all_gather_variable_first_dim(image_grid_thw, self.vision_dp_group)
+        self._debug_mdp_stage(
+            "before_gather_pixels",
+            schedule_group_size=dist.get_world_size(schedule_group),
+            schedule_group_rank=dist.get_rank(schedule_group),
+            pixel_shape=tuple(pixel_values.shape),
+            grid_shape=tuple(image_grid_thw.shape),
+            local_descs=len(local_descs),
+        )
+        gathered_pixels = self._all_gather_variable_first_dim(pixel_values, schedule_group)
+        self._debug_mdp_stage("after_gather_pixels")
+        gathered_grids = self._all_gather_variable_first_dim(image_grid_thw, schedule_group)
+        self._debug_mdp_stage("after_gather_grids")
 
         all_descs = []
         desc_id = 0
@@ -555,7 +645,7 @@ class Qwen35VLMimoModel(MimoModel):
             for row_idx, patch_count in enumerate(patch_counts):
                 token_count = patch_count // (self.spatial_merge_size * self.spatial_merge_size)
                 sample_idx = -1
-                if src_rank == dist.get_rank(self.vision_dp_group):
+                if src_rank == dist.get_rank(schedule_group):
                     for desc in local_descs:
                         if desc.row_idx == row_idx:
                             sample_idx = desc.sample_idx
@@ -575,8 +665,8 @@ class Qwen35VLMimoModel(MimoModel):
                 patch_start += patch_count
                 desc_id += 1
 
-        assignments = self._assign_visual_work(all_descs, dist.get_world_size(self.vision_dp_group))
-        my_worker = dist.get_rank(self.vision_dp_group)
+        assignments = self._assign_visual_work(all_descs, self._mdp_num_workers())
+        my_worker = self._mdp_worker_rank()
         my_descs = [desc for desc in all_descs if assignments[desc.desc_id] == my_worker]
         self._debug_mdp_schedule(local_descs, all_descs, assignments, my_descs)
 
@@ -608,18 +698,22 @@ class Qwen35VLMimoModel(MimoModel):
         if local_meta.numel() == 0:
             local_meta = torch.empty((0, 2), dtype=torch.long, device=pixel_values.device)
         gathered_embeddings = self._all_gather_variable_first_dim(
-            local_embeddings, self.vision_dp_group, differentiable=True
+            local_embeddings, schedule_group, differentiable=True
         )
-        gathered_meta = self._all_gather_variable_first_dim(local_meta, self.vision_dp_group)
+        gathered_meta = self._all_gather_variable_first_dim(local_meta, schedule_group)
         embedding_by_desc = {}
         for emb, meta in zip(gathered_embeddings, gathered_meta):
             offset = 0
             for desc_id, token_count in meta.tolist():
-                embedding_by_desc[int(desc_id)] = emb[offset : offset + int(token_count)]
+                embedding_by_desc.setdefault(int(desc_id), []).append(emb[offset : offset + int(token_count)])
                 offset += int(token_count)
+        embedding_by_desc = {
+            desc_id: torch.stack(chunks, dim=0).mean(dim=0)
+            for desc_id, chunks in embedding_by_desc.items()
+        }
 
         output_chunks = []
-        local_rank = dist.get_rank(self.vision_dp_group)
+        local_rank = dist.get_rank(schedule_group)
         local_desc_ids = [desc.desc_id for desc in all_descs if desc.src_rank == local_rank]
         for desc_id in local_desc_ids:
             output_chunks.append(embedding_by_desc[desc_id])
@@ -639,7 +733,7 @@ class Qwen35VLMimoModel(MimoModel):
     def _debug_mdp_schedule(self, local_descs, all_descs, assignments, my_descs):
         if os.getenv("MIMO_MDP_DEBUG", "0") != "1":
             return
-        if dist.get_rank(self.vision_dp_group) != 0:
+        if dist.get_rank(self._mdp_schedule_group()) != 0:
             return
         rank = dist.get_rank()
         global_rows = [
@@ -666,10 +760,10 @@ class Qwen35VLMimoModel(MimoModel):
             }
             for desc in all_descs
         ]
-        loads = [0 for _ in range(dist.get_world_size(self.vision_dp_group))]
+        loads = [0 for _ in range(self._mdp_num_workers())]
         counts = [0 for _ in loads]
-        source_loads = [0 for _ in loads]
-        source_counts = [0 for _ in loads]
+        source_loads = [0 for _ in range(dist.get_world_size(self._mdp_schedule_group()))]
+        source_counts = [0 for _ in source_loads]
         for desc in all_descs:
             worker = assignments[desc.desc_id]
             loads[worker] += desc.cost
@@ -704,8 +798,8 @@ class Qwen35VLMimoModel(MimoModel):
         local_embeddings.register_hook(_print_grad)
 
     def _normalize_mdp_visual_inputs(self, pixel_values, image_grid_thw, device):
-        if self.vision_dp_group is None:
-            raise ValueError("MIMO vision MDP requires a vision DP process group")
+        if self._mdp_schedule_group() is None:
+            raise ValueError("MIMO vision MDP requires an MDP scheduling process group")
         if image_grid_thw is None:
             image_grid_thw = torch.empty((0, 3), dtype=torch.long, device=device)
         if pixel_values is None:
@@ -739,16 +833,46 @@ class Qwen35VLMimoModel(MimoModel):
     def _validate_mdp_layout(self, packed):
         if packed:
             raise NotImplementedError("MIMO vision MDP does not support packed sequence yet")
-        if self.vision_grid is None or self.language_grid is None or self.vision_dp_group is None:
-            raise ValueError("MIMO vision MDP requires module grids and a vision DP group")
-        if self._grid_dim_size(self.vision_grid, "tp") != self._grid_dim_size(
+        if self.vision_grid is None or self.language_grid is None or self._mdp_schedule_group() is None:
+            raise ValueError("MIMO vision MDP requires module grids and an MDP scheduling group")
+        if not self._can_use_mdp_scheduler():
+            raise ValueError(
+                "MIMO vision MDP scheduler currently supports equal TP/DP or vision fan-out only"
+            )
+
+    def _can_use_mdp_scheduler(self):
+        if self.vision_grid is None or self.language_grid is None:
+            return False
+        vision_tp = self._grid_dim_size(self.vision_grid, "tp")
+        language_tp = self._grid_dim_size(self.language_grid, "tp")
+        vision_dp = self._grid_dim_size(self.vision_grid, "dp")
+        language_dp = self._grid_dim_size(self.language_grid, "dp")
+        return (vision_tp == language_tp and vision_dp == language_dp) or (
+            vision_tp > language_tp and language_tp == 1 and vision_dp < language_dp
+        )
+
+    def _mdp_schedule_group(self):
+        if self.vision_grid is None or self.language_grid is None:
+            return None
+        if self._grid_dim_size(self.vision_grid, "tp") == self._grid_dim_size(
             self.language_grid, "tp"
         ):
-            raise ValueError("MIMO vision MDP currently requires vision_tp == language_tp")
-        if self._grid_dim_size(self.vision_grid, "dp") != self._grid_dim_size(
-            self.language_grid, "dp"
+            return self.vision_dp_group
+        return self.language_dp_group
+
+    def _mdp_num_workers(self):
+        if self._grid_dim_size(self.vision_grid, "tp") == self._grid_dim_size(
+            self.language_grid, "tp"
         ):
-            raise ValueError("MIMO vision MDP currently requires vision_dp == language_dp")
+            return dist.get_world_size(self.vision_dp_group)
+        return self._grid_dim_size(self.vision_grid, "dp")
+
+    def _mdp_worker_rank(self):
+        if self._grid_dim_size(self.vision_grid, "tp") == self._grid_dim_size(
+            self.language_grid, "tp"
+        ):
+            return dist.get_rank(self.vision_dp_group)
+        return self._grid_dp_index(self.vision_grid)
 
     def _local_visual_descriptors(self, vision_stats):
         descs = []
@@ -759,7 +883,7 @@ class Qwen35VLMimoModel(MimoModel):
                 descs.append(
                     _VisualDescriptor(
                         desc_id=-1,
-                        src_rank=dist.get_rank(self.vision_dp_group),
+                        src_rank=dist.get_rank(self._mdp_schedule_group()),
                         sample_idx=sample_idx,
                         row_idx=row_idx,
                         patch_start=patch_start,
@@ -869,6 +993,12 @@ class Qwen35VLMimoModel(MimoModel):
                 f"language TP is 1; got vision TP={vision_tp_size}, language TP={language_tp_size}"
             )
 
+        self._debug_fanout(
+            "before_input_gather",
+            pixel_shape=tuple(pixel_values.shape),
+            grid_shape=tuple(image_grid_thw.shape),
+            stats={k: v for k, v in vision_stats.items() if not torch.is_tensor(v)},
+        )
         local_stats = torch.tensor(
             [
                 vision_stats["num_patches"],
@@ -882,23 +1012,23 @@ class Qwen35VLMimoModel(MimoModel):
             (vision_tp_size, local_stats.numel()), dtype=torch.long, device=pixel_values.device
         )
         dist.all_gather_into_tensor(gathered_stats, local_stats, group=self.vision_tp_group)
-        if not torch.equal(gathered_stats, gathered_stats[0].expand_as(gathered_stats)):
-            raise ValueError(
-                "pretrain_multimodal_mimo requires uniform visual tensor sizes across "
-                "the vision TP gather group because it uses all_gather_into_tensor and "
-                "equal bridge fan-out; got per-rank [patches, grid_rows, image_tokens]="
-                f"{gathered_stats.cpu().tolist()}"
-            )
+        split_sizes = [int(size) for size in gathered_stats[:, 2].tolist()]
+        self._debug_fanout(
+            "after_stats_gather",
+            gathered_stats=gathered_stats.cpu().tolist(),
+            split_sizes=split_sizes,
+        )
 
-        def _all_gather_first_dim(tensor):
-            tensor = tensor.contiguous()
-            out_shape = list(tensor.shape)
-            out_shape[0] *= dist.get_world_size(self.vision_tp_group)
-            output = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
-            dist.all_gather_into_tensor(output, tensor, group=self.vision_tp_group)
-            return output
-
-        return _all_gather_first_dim(pixel_values), _all_gather_first_dim(image_grid_thw)
+        gathered_pixels = self._all_gather_variable_first_dim(pixel_values, self.vision_tp_group)
+        gathered_grids = self._all_gather_variable_first_dim(image_grid_thw, self.vision_tp_group)
+        pixels = torch.cat(gathered_pixels, dim=0)
+        grids = torch.cat(gathered_grids, dim=0)
+        self._debug_fanout(
+            "after_input_gather",
+            pixel_shape=tuple(pixels.shape),
+            grid_shape=tuple(grids.shape),
+        )
+        return pixels, grids, split_sizes
 
     @staticmethod
     def _grid_dim_size(grid, dim_name):
@@ -920,6 +1050,7 @@ class Qwen35VLMimoModel(MimoModel):
         loss_mask,
         labels,
         modality_inputs,
+        image_bridge_split_sizes=None,
         packing_kwargs=None,
         packed_seq_params=None,
         padding_mask=None,
@@ -948,6 +1079,13 @@ class Qwen35VLMimoModel(MimoModel):
             ):
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
+                    if modality_name == "images" and image_bridge_split_sizes is not None:
+                        embeddings._mimo_bridge_split_sizes = image_bridge_split_sizes
+                    self._debug_fanout(
+                        "vision_encoder_output",
+                        embeddings_shape=tuple(embeddings.shape),
+                        split_sizes=image_bridge_split_sizes,
+                    )
                     modality_embeddings[modality_name] = embeddings
 
         if self.colocated_comms and not (
@@ -955,11 +1093,31 @@ class Qwen35VLMimoModel(MimoModel):
             and "images" in modality_inputs
             and "precomputed_embeddings" in modality_inputs["images"]
         ):
+            self._debug_fanout(
+                "before_colocated_bridge",
+                images_shape=(
+                    tuple(modality_embeddings["images"].shape)
+                    if "images" in modality_embeddings
+                    else None
+                ),
+            )
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+            self._debug_fanout(
+                "after_colocated_bridge",
+                images_shape=(
+                    tuple(modality_embeddings["images"].shape)
+                    if "images" in modality_embeddings
+                    else None
+                ),
+            )
 
         self._validate_image_embedding_count(input_ids, modality_embeddings)
 
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        if "images" in modality_embeddings and modality_embeddings["images"].numel() == 0:
+            # Empty image slices still need a graph edge so variable fan-out/MDP
+            # collectives run their backward on every rank in the group.
+            text_embeddings = text_embeddings + modality_embeddings["images"].sum() * 0.0
         modality_embeddings["text"] = text_embeddings
         combined_embeddings = self.align_embeddings_by_token_positions(
             modality_embeddings=modality_embeddings,
@@ -1042,6 +1200,22 @@ class Qwen35VLMimoModel(MimoModel):
                 "Number of image tokens does not match bridged image embeddings: "
                 f"image_tokens={num_image_tokens}, image_embeddings={image_embeddings.size(0)}"
             )
+
+    def _debug_fanout(self, stage, **kwargs):
+        if os.getenv("MIMO_MDP_DEBUG", "0") != "1":
+            return
+        rank = dist.get_rank()
+        vision_tp_rank = (
+            dist.get_rank(self.vision_tp_group) if self.vision_tp_group is not None else 0
+        )
+        language_tp_rank = (
+            dist.get_rank(self.language_tp_group) if self.language_tp_group is not None else 0
+        )
+        print(
+            f"[MIMO fanout][rank {rank}][vtp {vision_tp_rank}][ltp {language_tp_rank}] "
+            f"{stage} {kwargs}",
+            flush=True,
+        )
 
 
 def _build_qwen35_vl_mimo_model(
@@ -1135,6 +1309,7 @@ def _build_qwen35_vl_mimo_model(
         cp_group=language_pg_collection.cp if language_pg_collection is not None else None,
         tp_group=language_pg_collection.tp if language_pg_collection is not None else None,
         vision_dp_group=vision_pg_collection.dp if vision_pg_collection is not None else None,
+        language_dp_group=language_pg_collection.dp if language_pg_collection is not None else None,
         vision_mdp_enabled=getattr(args, "mimo_vision_mdp", False),
         vision_mdp_scheduler=getattr(args, "mimo_vision_mdp_scheduler", "lpt"),
         vision_mdp_cost_proxy=getattr(args, "mimo_vision_mdp_cost_proxy", "p2"),

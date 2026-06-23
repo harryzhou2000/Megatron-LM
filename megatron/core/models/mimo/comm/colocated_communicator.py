@@ -226,6 +226,18 @@ class ColocatedBridgeCommunicator:
         slice_size = batch_size // self.scale
         return SliceInfo(start=slot * slice_size, size=slice_size)
 
+    def get_variable_slice_info(self, split_sizes: List[int]) -> SliceInfo:
+        """Compute this FAN_OUT rank's variable-size slice."""
+        if self.direction is not BridgeDirection.FAN_OUT:
+            return SliceInfo(start=0, size=sum(split_sizes))
+        if len(split_sizes) != self.scale:
+            raise ValueError(
+                f"Expected {self.scale} fan-out split sizes, got {len(split_sizes)}"
+            )
+        dp_idx = self.rank_to_dest_pos[self.current_rank][0]
+        slot = dp_idx % self.scale
+        return SliceInfo(start=sum(split_sizes[:slot]), size=split_sizes[slot])
+
     def _check_divisible(self, batch_size: int) -> None:
         if batch_size % self.scale != 0:
             raise ValueError(
@@ -240,7 +252,8 @@ class ColocatedBridgeCommunicator:
         divisible by ``scale``; FAN_IN only slices on the backward pass
         and re-checks via ``get_slice_info`` there.
         """
-        if self.direction is BridgeDirection.FAN_OUT:
+        split_sizes = getattr(tensor, '_mimo_bridge_split_sizes', None)
+        if self.direction is BridgeDirection.FAN_OUT and split_sizes is None:
             self._check_divisible(tensor.shape[self.dim_mapping['b']])
         return _ColocatedCommunicate.apply(tensor, self)
 
@@ -263,10 +276,16 @@ class _ColocatedCommunicate(torch.autograd.Function):
         """Reshape the batch dim across the bridge: narrow on fan-out, all-gather on fan-in."""
         ctx.comm = comm
         ctx.batch_dim = comm.dim_mapping['b']
+        split_sizes = getattr(tensor, '_mimo_bridge_split_sizes', None)
+        ctx.split_sizes = [int(size) for size in split_sizes] if split_sizes is not None else None
 
         if comm.direction is BridgeDirection.FAN_OUT:
             # Narrow this rank's slice out of the full src batch.
-            slice_info = comm.get_slice_info(tensor.shape[ctx.batch_dim])
+            slice_info = (
+                comm.get_variable_slice_info(ctx.split_sizes)
+                if ctx.split_sizes is not None
+                else comm.get_slice_info(tensor.shape[ctx.batch_dim])
+            )
             return tensor.narrow(ctx.batch_dim, slice_info.start, slice_info.size).contiguous()
 
         if comm.direction is BridgeDirection.FAN_IN:
@@ -292,6 +311,10 @@ class _ColocatedCommunicate(torch.autograd.Function):
         batch_dim = ctx.batch_dim
 
         if comm.direction is BridgeDirection.FAN_OUT:
+            if ctx.split_sizes is not None:
+                return _all_gather_variable_along_batch_dim(
+                    grad_output, comm.gather_pg, batch_dim, ctx.split_sizes
+                ), None
             return _all_gather_along_batch_dim(grad_output, comm.gather_pg, batch_dim), None
 
         if comm.direction is BridgeDirection.FAN_IN:
@@ -320,6 +343,36 @@ def _all_gather_along_batch_dim(
     out_shape[0] *= world_size
     out = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
     dist.all_gather_into_tensor(out, src, group=group)
+    if batch_dim != 0:
+        out = out.movedim(0, batch_dim).contiguous()
+    return out
+
+
+def _all_gather_variable_along_batch_dim(
+    tensor: torch.Tensor, group: dist.ProcessGroup, batch_dim: int, split_sizes: List[int]
+) -> torch.Tensor:
+    """All-gather variable-size tensors along batch dim and concatenate."""
+    src = tensor.contiguous()
+    if batch_dim != 0:
+        src = src.movedim(batch_dim, 0).contiguous()
+
+    local_size = torch.tensor([src.shape[0]], dtype=torch.long, device=src.device)
+    gathered_sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered_sizes, local_size, group=group)
+    gathered_sizes = [int(size.item()) for size in gathered_sizes]
+    if gathered_sizes != split_sizes:
+        raise ValueError(
+            f"Fan-out backward grad sizes {gathered_sizes} do not match forward split_sizes "
+            f"{split_sizes}"
+        )
+
+    max_size = max(max(gathered_sizes), 1)
+    padded = torch.zeros((max_size, *src.shape[1:]), dtype=src.dtype, device=src.device)
+    if src.shape[0] > 0:
+        padded[: src.shape[0]] = src
+    gathered = [torch.empty_like(padded) for _ in gathered_sizes]
+    dist.all_gather(gathered, padded, group=group)
+    out = torch.cat([item[:size] for item, size in zip(gathered, gathered_sizes)], dim=0)
     if batch_dim != 0:
         out = out.movedim(0, batch_dim).contiguous()
     return out
