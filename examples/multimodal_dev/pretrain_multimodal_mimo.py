@@ -646,6 +646,13 @@ def _build_qwen35_vl_mimo_model(
     args, language_config, vision_config, pre_process=True, post_process=True
 ):
     """Build a colocated Qwen3.5-VL MIMO model."""
+    if getattr(args, "use_megatron_fsdp", False):
+        raise ValueError(
+            "pretrain_multimodal_mimo does not support --use-megatron-fsdp yet. "
+            "Whole-model FSDP uses one process-group layout, which is unsafe for "
+            "heterogeneous MIMO vision/language TP-DP layouts."
+        )
+
     module_to_grid_map, vision_pg_collection, language_pg_collection = (
         _build_module_parallel_context(args)
     )
