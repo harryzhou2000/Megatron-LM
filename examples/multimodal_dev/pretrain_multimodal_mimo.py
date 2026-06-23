@@ -20,6 +20,7 @@ enabled here yet.
 import importlib
 import os
 import sys
+from dataclasses import dataclass
 from functools import partial
 
 import torch
@@ -64,6 +65,42 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
+@dataclass(frozen=True)
+class _VisualDescriptor:
+    desc_id: int
+    src_rank: int
+    sample_idx: int
+    row_idx: int
+    patch_start: int
+    patch_end: int
+    token_count: int
+    cost: int
+
+
+class _VariableAllGather(torch.autograd.Function):
+    """Autograd-preserving all-gather for tensors with variable dim 0."""
+
+    @staticmethod
+    def forward(ctx, tensor, group, sizes):
+        local_size = tensor.shape[0]
+        max_size = max(max(sizes), 1)
+        padded = torch.zeros((max_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        if local_size > 0:
+            padded[:local_size] = tensor.contiguous()
+        gathered = [torch.empty_like(padded) for _ in sizes]
+        dist.all_gather(gathered, padded, group=group)
+        ctx.group = group
+        ctx.local_size = local_size
+        ctx.local_rank = dist.get_rank(group)
+        return torch.stack(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_local = grad_output[ctx.local_rank].contiguous()
+        dist.all_reduce(grad_local, group=ctx.group)
+        return grad_local[: ctx.local_size], None, None
+
+
 def add_multimodal_mimo_args(parser):
     """Add Qwen3.5-VL MIMO-specific arguments."""
     parser = add_multimodal_args(parser)
@@ -79,6 +116,29 @@ def add_multimodal_mimo_args(parser):
         action="store_true",
         default=False,
         help="Disable module_to_grid_map and use legacy all-modules-colocated MIMO behavior.",
+    )
+    group.add_argument(
+        "--mimo-vision-mdp",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable experimental MDP-style dynamic image scheduling for Qwen MIMO. "
+            "Currently supports colocated vision_tp == language_tp, PP=CP=1, padded batches."
+        ),
+    )
+    group.add_argument(
+        "--mimo-vision-mdp-scheduler",
+        type=str,
+        default="lpt",
+        choices=["static", "lpt"],
+        help="Image scheduling policy for --mimo-vision-mdp.",
+    )
+    group.add_argument(
+        "--mimo-vision-mdp-cost-proxy",
+        type=str,
+        default="p2",
+        choices=["p2", "raw_patch"],
+        help="Image cost proxy for LPT scheduling.",
     )
     return parser
 
@@ -173,6 +233,10 @@ class Qwen35VLMimoModel(MimoModel):
         vision_tp_group=None,
         cp_group=None,
         tp_group=None,
+        vision_dp_group=None,
+        vision_mdp_enabled: bool = False,
+        vision_mdp_scheduler: str = "lpt",
+        vision_mdp_cost_proxy: str = "p2",
         vision_grid=None,
         language_grid=None,
     ) -> None:
@@ -183,6 +247,10 @@ class Qwen35VLMimoModel(MimoModel):
         self.spatial_merge_size = spatial_merge_size
         self.vision_tp_group = vision_tp_group
         self.language_tp_group = tp_group
+        self.vision_dp_group = vision_dp_group
+        self.vision_mdp_enabled = vision_mdp_enabled
+        self.vision_mdp_scheduler = vision_mdp_scheduler
+        self.vision_mdp_cost_proxy = vision_mdp_cost_proxy
         self.vision_grid = vision_grid
         self.language_grid = language_grid
 
@@ -268,6 +336,8 @@ class Qwen35VLMimoModel(MimoModel):
             )
         if (input_ids == self.video_token_id).any().item():
             raise ValueError("pretrain_multimodal_mimo currently supports image tokens only")
+        if self.vision_mdp_enabled:
+            self._reject_mdp_zero_local_images(pixel_values, image_grid_thw)
         vision_stats = None
         if pixel_values is not None:
             vision_stats = self._validate_vision_inputs(
@@ -285,17 +355,26 @@ class Qwen35VLMimoModel(MimoModel):
 
         modality_inputs = None
         if pixel_values is not None:
-            pixel_values, image_grid_thw = self._prepare_vision_inputs_for_bridge(
-                pixel_values, image_grid_thw, vision_stats
-            )
-            modality_inputs = {
-                "images": {
-                    "qwen35_vision_encoder": {
-                        "pixel_values": pixel_values,
-                        "grid_thw": image_grid_thw,
+            if self.vision_mdp_enabled:
+                image_embeddings = self._encode_images_with_mdp(
+                    pixel_values,
+                    image_grid_thw,
+                    vision_stats,
+                    packed=packed_seq_params is not None,
+                )
+                modality_inputs = {"images": {"precomputed_embeddings": image_embeddings}}
+            else:
+                pixel_values, image_grid_thw = self._prepare_vision_inputs_for_bridge(
+                    pixel_values, image_grid_thw, vision_stats
+                )
+                modality_inputs = {
+                    "images": {
+                        "qwen35_vision_encoder": {
+                            "pixel_values": pixel_values,
+                            "grid_thw": image_grid_thw,
+                        }
                     }
                 }
-            }
 
         output, _ = self._forward_all_modules(
             input_ids=input_ids,
@@ -350,7 +429,11 @@ class Qwen35VLMimoModel(MimoModel):
                 "Number of image tokens must match post-merge visual tokens: "
                 f"image_tokens={num_image_tokens}, visual_tokens={num_visual_tokens}"
             )
-        if token_counts.numel() > 1 and token_counts.unique().numel() != 1:
+        if (
+            not self.vision_mdp_enabled
+            and token_counts.numel() > 1
+            and token_counts.unique().numel() != 1
+        ):
             raise ValueError(
                 "pretrain_multimodal_mimo currently requires a uniform number of image "
                 "tokens per sample because the colocated bridge equal-slices flattened "
@@ -362,6 +445,7 @@ class Qwen35VLMimoModel(MimoModel):
             "num_grid_rows": int(image_grid_thw.shape[0]),
             "num_image_tokens": num_image_tokens,
             "patch_counts": patch_counts,
+            "merged_patch_counts": patch_counts // merge_area,
             "sample_grid_ranges": self._sample_grid_ranges(
                 token_counts=token_counts,
                 merged_patch_counts=patch_counts // merge_area,
@@ -432,6 +516,195 @@ class Qwen35VLMimoModel(MimoModel):
         if vision_dp_size > language_dp_size:
             return self._slice_vision_inputs_for_fan_in(pixel_values, image_grid_thw, vision_stats)
         return self._gather_vision_inputs_for_fan_out(pixel_values, image_grid_thw, vision_stats)
+
+    def _encode_images_with_mdp(self, pixel_values, image_grid_thw, vision_stats, packed=False):
+        """Schedule variable-size images across the vision DP group and restore local order."""
+        self._validate_mdp_layout(packed=packed)
+        local_descs = self._local_visual_descriptors(vision_stats)
+        gathered_pixels = self._all_gather_variable_first_dim(pixel_values, self.vision_dp_group)
+        gathered_grids = self._all_gather_variable_first_dim(image_grid_thw, self.vision_dp_group)
+
+        all_descs = []
+        desc_id = 0
+        for src_rank, grid in enumerate(gathered_grids):
+            patch_counts = grid.to(torch.long).prod(dim=1).tolist()
+            # Rebuild row-local descriptors for every source rank. Sample ownership is
+            # only needed for this rank's final selection, so non-local rows use sample -1.
+            patch_start = 0
+            for row_idx, patch_count in enumerate(patch_counts):
+                token_count = patch_count // (self.spatial_merge_size * self.spatial_merge_size)
+                sample_idx = -1
+                if src_rank == dist.get_rank(self.vision_dp_group):
+                    for desc in local_descs:
+                        if desc.row_idx == row_idx:
+                            sample_idx = desc.sample_idx
+                            break
+                all_descs.append(
+                    _VisualDescriptor(
+                        desc_id=desc_id,
+                        src_rank=src_rank,
+                        sample_idx=sample_idx,
+                        row_idx=row_idx,
+                        patch_start=patch_start,
+                        patch_end=patch_start + patch_count,
+                        token_count=token_count,
+                        cost=self._visual_cost(patch_count),
+                    )
+                )
+                patch_start += patch_count
+                desc_id += 1
+
+        assignments = self._assign_visual_work(all_descs, dist.get_world_size(self.vision_dp_group))
+        my_worker = dist.get_rank(self.vision_dp_group)
+        my_descs = [desc for desc in all_descs if assignments[desc.desc_id] == my_worker]
+        assigned_counts = [0 for _ in range(dist.get_world_size(self.vision_dp_group))]
+        for worker in assignments.values():
+            assigned_counts[worker] += 1
+        if min(assigned_counts) == 0:
+            raise ValueError(
+                "MIMO vision MDP currently requires every vision DP worker to receive at "
+                f"least one image; assignment counts={assigned_counts}"
+            )
+
+        local_pixels, local_grid = self._materialize_assigned_visual_inputs(
+            my_descs, gathered_pixels, gathered_grids, pixel_values
+        )
+        vision_submodule = unwrap_model(self.modality_submodules["images"])
+        local_embeddings = vision_submodule.encoders["qwen35_vision_encoder"](
+            pixel_values=local_pixels, grid_thw=local_grid
+        )
+        local_meta = torch.tensor(
+            [[desc.desc_id, desc.token_count] for desc in my_descs],
+            dtype=torch.long,
+            device=pixel_values.device,
+        )
+        if local_meta.numel() == 0:
+            local_meta = torch.empty((0, 2), dtype=torch.long, device=pixel_values.device)
+        gathered_embeddings = self._all_gather_variable_first_dim(
+            local_embeddings, self.vision_dp_group, differentiable=True
+        )
+        gathered_meta = self._all_gather_variable_first_dim(local_meta, self.vision_dp_group)
+        embedding_by_desc = {}
+        for emb, meta in zip(gathered_embeddings, gathered_meta):
+            offset = 0
+            for desc_id, token_count in meta.tolist():
+                embedding_by_desc[int(desc_id)] = emb[offset : offset + int(token_count)]
+                offset += int(token_count)
+
+        output_chunks = []
+        local_rank = dist.get_rank(self.vision_dp_group)
+        local_desc_ids = [desc.desc_id for desc in all_descs if desc.src_rank == local_rank]
+        for desc_id in local_desc_ids:
+            output_chunks.append(embedding_by_desc[desc_id])
+        return torch.cat(output_chunks, dim=0) if output_chunks else local_embeddings
+
+    def _reject_mdp_zero_local_images(self, pixel_values, image_grid_thw):
+        if self.vision_dp_group is None:
+            raise ValueError("MIMO vision MDP requires a vision DP process group")
+        device = (
+            pixel_values.device
+            if pixel_values is not None
+            else torch.device(f"cuda:{torch.cuda.current_device()}")
+        )
+        local_empty = int(
+            pixel_values is None
+            or image_grid_thw is None
+            or image_grid_thw.numel() == 0
+            or pixel_values.shape[0] == 0
+        )
+        flag = torch.tensor([local_empty], dtype=torch.long, device=device)
+        dist.all_reduce(flag, group=self.vision_dp_group)
+        if flag.item() > 0:
+            raise ValueError(
+                "MIMO vision MDP does not yet support local ranks with zero images; "
+                "bucket batches so every vision DP worker has at least one image"
+            )
+
+    def _validate_mdp_layout(self, packed):
+        if packed:
+            raise NotImplementedError("MIMO vision MDP does not support packed sequence yet")
+        if self.vision_grid is None or self.language_grid is None or self.vision_dp_group is None:
+            raise ValueError("MIMO vision MDP requires module grids and a vision DP group")
+        if self._grid_dim_size(self.vision_grid, "tp") != self._grid_dim_size(
+            self.language_grid, "tp"
+        ):
+            raise ValueError("MIMO vision MDP currently requires vision_tp == language_tp")
+        if self._grid_dim_size(self.vision_grid, "dp") != self._grid_dim_size(
+            self.language_grid, "dp"
+        ):
+            raise ValueError("MIMO vision MDP currently requires vision_dp == language_dp")
+
+    def _local_visual_descriptors(self, vision_stats):
+        descs = []
+        for sample_idx, (row_start, row_end) in enumerate(vision_stats["sample_grid_ranges"]):
+            for row_idx in range(row_start, row_end):
+                patch_start = int(vision_stats["patch_counts"][:row_idx].sum().item())
+                patch_count = int(vision_stats["patch_counts"][row_idx].item())
+                descs.append(
+                    _VisualDescriptor(
+                        desc_id=-1,
+                        src_rank=dist.get_rank(self.vision_dp_group),
+                        sample_idx=sample_idx,
+                        row_idx=row_idx,
+                        patch_start=patch_start,
+                        patch_end=patch_start + patch_count,
+                        token_count=int(vision_stats["merged_patch_counts"][row_idx].item()),
+                        cost=self._visual_cost(patch_count),
+                    )
+                )
+        return descs
+
+    def _visual_cost(self, patch_count):
+        if self.vision_mdp_cost_proxy == "raw_patch":
+            hidden = self.config.hidden_size
+            return patch_count * patch_count * hidden + patch_count * hidden * hidden
+        return patch_count * patch_count
+
+    def _assign_visual_work(self, descs, num_workers):
+        assignments = {}
+        if self.vision_mdp_scheduler == "static":
+            for idx, desc in enumerate(descs):
+                assignments[desc.desc_id] = idx % num_workers
+            return assignments
+        loads = [0 for _ in range(num_workers)]
+        for desc in sorted(descs, key=lambda d: (-d.cost, d.desc_id)):
+            worker = min(range(num_workers), key=lambda idx: (loads[idx], idx))
+            assignments[desc.desc_id] = worker
+            loads[worker] += desc.cost
+        return assignments
+
+    @staticmethod
+    def _materialize_assigned_visual_inputs(descs, gathered_pixels, gathered_grids, like_tensor):
+        pixel_chunks = [gathered_pixels[d.src_rank][d.patch_start : d.patch_end] for d in descs]
+        grid_chunks = [gathered_grids[d.src_rank][d.row_idx : d.row_idx + 1] for d in descs]
+        if not pixel_chunks:
+            return like_tensor[:0], torch.empty((0, 3), dtype=torch.long, device=like_tensor.device)
+        return torch.cat(pixel_chunks, dim=0).contiguous(), torch.cat(grid_chunks, dim=0).contiguous()
+
+    @staticmethod
+    def _all_gather_variable_first_dim(tensor, group, differentiable=False):
+        size = torch.tensor([tensor.shape[0]], dtype=torch.long, device=tensor.device)
+        sizes = [torch.empty_like(size) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(sizes, size, group=group)
+        sizes = [int(s.item()) for s in sizes]
+        trailing_shape = torch.tensor(list(tensor.shape[1:]), dtype=torch.long, device=tensor.device)
+        gathered_trailing = [torch.empty_like(trailing_shape) for _ in sizes]
+        dist.all_gather(gathered_trailing, trailing_shape, group=group)
+        if any(not torch.equal(trailing_shape, other) for other in gathered_trailing):
+            raise ValueError(
+                "_all_gather_variable_first_dim requires identical non-leading dimensions"
+            )
+        if differentiable:
+            gathered = _VariableAllGather.apply(tensor, group, sizes)
+            return [gathered[idx, :size].contiguous() for idx, size in enumerate(sizes)]
+        max_size = max(max(sizes), 1)
+        padded_shape = (max_size, *tensor.shape[1:])
+        padded = torch.zeros(padded_shape, dtype=tensor.dtype, device=tensor.device)
+        if tensor.shape[0] > 0:
+            padded[: tensor.shape[0]] = tensor.contiguous()
+        gathered = [torch.empty_like(padded) for _ in sizes]
+        dist.all_gather(gathered, padded, group=group)
+        return [item[:size].contiguous() for item, size in zip(gathered, sizes)]
 
     def _slice_vision_inputs_for_fan_in(self, pixel_values, image_grid_thw, vision_stats):
         """Give each vision DP slot its shard of the local language MBS."""
@@ -546,13 +819,26 @@ class Qwen35VLMimoModel(MimoModel):
             if (
                 modality_inputs
                 and modality_name in modality_inputs
+                and "precomputed_embeddings" in modality_inputs[modality_name]
+            ):
+                modality_embeddings[modality_name] = modality_inputs[modality_name][
+                    "precomputed_embeddings"
+                ]
+                continue
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
                 and modality_inputs[modality_name] is not None
             ):
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
                     modality_embeddings[modality_name] = embeddings
 
-        if self.colocated_comms:
+        if self.colocated_comms and not (
+            modality_inputs
+            and "images" in modality_inputs
+            and "precomputed_embeddings" in modality_inputs["images"]
+        ):
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         self._validate_image_embedding_count(input_ids, modality_embeddings)
@@ -652,6 +938,8 @@ def _build_qwen35_vl_mimo_model(
             "Whole-model FSDP uses one process-group layout, which is unsafe for "
             "heterogeneous MIMO vision/language TP-DP layouts."
         )
+    if getattr(args, "use_torch_fsdp2", False):
+        raise ValueError("pretrain_multimodal_mimo does not support --use-torch-fsdp2 yet")
 
     module_to_grid_map, vision_pg_collection, language_pg_collection = (
         _build_module_parallel_context(args)
@@ -730,6 +1018,10 @@ def _build_qwen35_vl_mimo_model(
         vision_tp_group=vision_pg_collection.tp if vision_pg_collection is not None else None,
         cp_group=language_pg_collection.cp if language_pg_collection is not None else None,
         tp_group=language_pg_collection.tp if language_pg_collection is not None else None,
+        vision_dp_group=vision_pg_collection.dp if vision_pg_collection is not None else None,
+        vision_mdp_enabled=getattr(args, "mimo_vision_mdp", False),
+        vision_mdp_scheduler=getattr(args, "mimo_vision_mdp_scheduler", "lpt"),
+        vision_mdp_cost_proxy=getattr(args, "mimo_vision_mdp_cost_proxy", "p2"),
         vision_grid=module_to_grid_map["images"] if module_to_grid_map is not None else None,
         language_grid=(
             module_to_grid_map[MIMO_LANGUAGE_MODULE_KEY] if module_to_grid_map is not None else None
