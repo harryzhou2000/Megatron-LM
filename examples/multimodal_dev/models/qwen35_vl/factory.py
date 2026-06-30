@@ -6,10 +6,7 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from examples.multimodal_dev.models.qwen35_vl.configuration import (
-    MROPE_SECTION,
-    VISION_KWARGS,
-)
+from examples.multimodal_dev.models.qwen35_vl.configuration import MROPE_SECTION, VISION_KWARGS
 
 
 def post_language_config(language_config, args):
@@ -20,6 +17,12 @@ def post_language_config(language_config, args):
     """
     language_config.mrope_section = list(MROPE_SECTION)
     language_config.mrope_interleaved = True
+    if (
+        getattr(args, "use_packed_sequence", False)
+        and getattr(args, "moe_token_dispatcher_type", None) == "flex"
+        and getattr(args, "moe_flex_dispatcher_backend", None) == "hybridep"
+    ):
+        language_config.moe_hybridep_pad_variable_tokens = True
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):
@@ -54,19 +57,20 @@ def build_model(args, language_config, vision_config, **kwargs):
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_mtp_block_spec,
-    )
-
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-    from examples.multimodal_dev.models.qwen35_vl.specs import (
-        get_qwen35_vl_language_spec,
-    )
+    from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_language_spec
+    from megatron.core import parallel_state
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+
+    vp_stage = kwargs.get("vp_stage", None)
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pre_process = kwargs.get("pre_process", True)
+    post_process = kwargs.get("post_process", True)
 
     language_spec = get_qwen35_vl_language_spec(
         config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
+        vp_stage=vp_stage,
+        pp_rank=pp_rank,
     )
 
     mtp_block_spec = None
@@ -77,8 +81,8 @@ def build_model(args, language_config, vision_config, **kwargs):
             use_transformer_engine=(
                 args.transformer_impl == "transformer_engine"
             ),
-            vp_stage=kwargs.get("vp_stage", None),
-            pp_rank=None,
+            vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
 
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
@@ -98,4 +102,7 @@ def build_model(args, language_config, vision_config, **kwargs):
         mtp_block_spec=mtp_block_spec,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
     )

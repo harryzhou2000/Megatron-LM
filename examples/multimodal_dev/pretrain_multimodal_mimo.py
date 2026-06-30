@@ -831,8 +831,6 @@ class Qwen35VLMimoModel(MimoModel):
         return pixels, grid
 
     def _validate_mdp_layout(self, packed):
-        if packed:
-            raise NotImplementedError("MIMO vision MDP does not support packed sequence yet")
         if self.vision_grid is None or self.language_grid is None or self._mdp_schedule_group() is None:
             raise ValueError("MIMO vision MDP requires module grids and an MDP scheduling group")
         if not self._can_use_mdp_scheduler():
@@ -1135,11 +1133,9 @@ class Qwen35VLMimoModel(MimoModel):
         lm_input_ids = input_ids
         lm_position_ids = position_ids
         if self.config.sequence_parallel:
-            if packed_seq_params is not None:
-                raise NotImplementedError(
-                    "pretrain_multimodal_mimo does not support packed sequence with "
-                    "sequence_parallel yet because packed metadata remains global"
-                )
+            # THD PackedSeqParams intentionally remains global/duplicated across
+            # TP ranks. Match MCore GPT's THD+SP contract by sharding sequence
+            # tensors but not the packed metadata.
             lm_input_ids = self._sp_shard_batch_sequence(input_ids)
             lm_position_ids = self._sp_shard_position_ids(position_ids)
         if padding_mask is not None and self.config.sequence_parallel:

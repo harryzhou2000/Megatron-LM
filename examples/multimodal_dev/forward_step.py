@@ -16,6 +16,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 from megatron.training import get_args
 
@@ -169,7 +171,7 @@ def _build_packed_seq_params_from_cu_seqlens(
 
 
 def pack_or_pad_batch(
-    batch: Optional[list[Dict[str, Any]]],
+    batch: Optional[list[Dict[str, Any]] | Dict[str, Any]],
     use_packed_sequence: bool = False,
     seq_length: Optional[int] = None,
     device="cuda",
@@ -200,6 +202,16 @@ def pack_or_pad_batch(
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
     else:
         divisible_by = tp_size if has_sp else 1
+
+    if is_src and isinstance(batch, dict):
+        if use_packed_sequence:
+            raise ValueError(
+                "pre-collated dict batches are not supported with --use-packed-sequence yet"
+            )
+        padded_batch = dict(batch)
+        if "padding_mask" not in padded_batch and padded_batch.get("input_ids") is not None:
+            padded_batch["padding_mask"] = torch.zeros_like(padded_batch["input_ids"], dtype=torch.bool)
+        return broadcast_data_batch(padded_batch, device=device)
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
@@ -281,7 +293,16 @@ def pack_or_pad_batch(
     if is_src:
         assert batch is not None, "source TP rank must provide a batch"
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
-        target_seqlens = min(max_seqlens, seq_length)
+        try:
+            force_fixed_bshd = bool(getattr(get_args(), "mock_variable_seq_length", False))
+        except AssertionError:
+            force_fixed_bshd = False
+        target_seqlens = seq_length if force_fixed_bshd else min(max_seqlens, seq_length)
+        if max_seqlens > target_seqlens:
+            raise ValueError(
+                "Cannot pad BSHD batch because at least one sample exceeds target sequence length: "
+                f"max_sample_length={max_seqlens}, target_seqlens={target_seqlens}"
+            )
         # Round target seqlen up to the parallelism alignment factor so the
         # batched tensor is divisible for CP (+SP) splitting downstream.
         if divisible_by > 1:
@@ -397,7 +418,10 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
-    pixel_values = batch.get("pixel_values", None)
+    is_first_stage = is_pipeline_first_stage()
+    is_last_stage = is_pipeline_last_stage()
+
+    pixel_values = batch.get("pixel_values", None) if is_first_stage else None
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -427,6 +451,7 @@ def forward_step(data_iterator, model):
     # so the slicing rule lives in one place.
     from examples.multimodal_dev.models.base import MultimodalModel
 
-    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
+    if is_last_stage:
+        loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
 
     return output_tensor, partial(loss_func, loss_mask)

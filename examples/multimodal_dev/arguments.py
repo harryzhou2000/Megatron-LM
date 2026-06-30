@@ -64,6 +64,15 @@ def add_multimodal_args(parser):
         help="Comma-separated square image sizes for variable mock images.",
     )
     group.add_argument(
+        "--mock-image-size-weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated weights for mock_image_size_choices. "
+            "For 224/448/896 with small images more common, use e.g. '8,2,1'."
+        ),
+    )
+    group.add_argument(
         "--mock-image-count-weights",
         type=str,
         default=None,
@@ -78,6 +87,24 @@ def add_multimodal_args(parser):
         type=int,
         default=1234,
         help="Base seed for deterministic per-sample mock data generation.",
+    )
+    group.add_argument(
+        "--mock-variable-seq-length",
+        action="store_true",
+        default=False,
+        help="Generate variable total sequence lengths for mock multimodal samples.",
+    )
+    group.add_argument(
+        "--mock-min-seq-length",
+        type=int,
+        default=None,
+        help="Minimum total sequence length when --mock-variable-seq-length is enabled.",
+    )
+    group.add_argument(
+        "--mock-max-seq-length",
+        type=int,
+        default=None,
+        help="Maximum total sequence length when --mock-variable-seq-length is enabled.",
     )
     group.add_argument(
         "--total-seq-length",
