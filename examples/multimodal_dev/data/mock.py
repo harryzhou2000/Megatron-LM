@@ -52,8 +52,12 @@ class MockQwen35VLDataset(Dataset):
         min_images_per_sample: int = 1,
         max_images_per_sample: int = 3,
         image_size_choices: str = "224,448",
+        image_size_weights: str = None,
         image_count_weights: str = None,
         random_seed: int = 1234,
+        variable_seq_length: bool = False,
+        min_seq_length: int = None,
+        max_seq_length: int = None,
     ):
         self.num_samples = num_samples
         self.seq_length = seq_length
@@ -68,11 +72,40 @@ class MockQwen35VLDataset(Dataset):
         self.variable_images = variable_images
         self.min_images_per_sample = min_images_per_sample
         self.max_images_per_sample = max_images_per_sample
+        self.variable_seq_length = variable_seq_length
+        self.min_seq_length = (
+            min_seq_length if min_seq_length is not None else max(1, seq_length // 2)
+        )
+        self.max_seq_length = max_seq_length if max_seq_length is not None else seq_length
+        if self.variable_seq_length:
+            if self.min_seq_length <= 0 or self.max_seq_length < self.min_seq_length:
+                raise ValueError(
+                    "mock variable sequence length range must satisfy "
+                    "0 < min_seq_length <= max_seq_length"
+                )
+            if self.max_seq_length > self.seq_length:
+                raise ValueError(
+                    "mock_max_seq_length cannot exceed total_seq_length; "
+                    f"got max_seq_length={self.max_seq_length}, total_seq_length={self.seq_length}"
+                )
         self.image_size_choices = [
             int(size.strip()) for size in image_size_choices.split(",") if size.strip()
         ]
         if not self.image_size_choices:
             self.image_size_choices = [image_size]
+        self.image_size_weights = None
+        if image_size_weights is not None:
+            weights = [
+                float(weight.strip()) for weight in image_size_weights.split(",") if weight.strip()
+            ]
+            if len(weights) != len(self.image_size_choices):
+                raise ValueError(
+                    "mock_image_size_weights must have one weight per mock_image_size_choices; "
+                    f"expected={len(self.image_size_choices)}, got={len(weights)}"
+                )
+            if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+                raise ValueError("mock_image_size_weights must be non-negative and nonzero")
+            self.image_size_weights = torch.tensor(weights, dtype=torch.float)
         if self.min_images_per_sample < 0 or self.max_images_per_sample < self.min_images_per_sample:
             raise ValueError(
                 "mock image count range must satisfy 0 <= min_images <= max_images"
@@ -103,8 +136,12 @@ class MockQwen35VLDataset(Dataset):
             * (h_patches // spatial_merge_size)
             * (w_patches // spatial_merge_size)
         )
-        self.image_seq_length = min(
-            image_seq_length, self.num_merged_tokens,
+        # Fixed-image mode keeps the historical single-image cap. Variable-image
+        # mode uses this as the per-sample cap for total post-merge image tokens.
+        self.image_seq_length = (
+            image_seq_length
+            if variable_images
+            else min(image_seq_length, self.num_merged_tokens)
         )
         self.total_patches = t_patches * h_patches * w_patches
 
@@ -126,9 +163,15 @@ class MockQwen35VLDataset(Dataset):
             num_images = self.min_images_per_sample + int(sampled)
         rows = []
         for image_idx in range(num_images):
-            image_size = self.image_size_choices[
-                int(torch.randint(len(self.image_size_choices), (1,), generator=generator).item())
-            ]
+            if self.image_size_weights is None:
+                size_idx = int(
+                    torch.randint(len(self.image_size_choices), (1,), generator=generator).item()
+                )
+            else:
+                size_idx = int(
+                    torch.multinomial(self.image_size_weights, 1, generator=generator).item()
+                )
+            image_size = self.image_size_choices[size_idx]
             if image_size % (self.patch_size * self.spatial_merge_size) != 0:
                 raise ValueError(
                     "mock image sizes must be divisible by patch_size * spatial_merge_size; "
@@ -142,6 +185,41 @@ class MockQwen35VLDataset(Dataset):
                     image_size // self.patch_size,
                 ]
             )
+        if self.variable_images and self.image_seq_length >= 0:
+            capped_rows = []
+            total_merged_tokens = 0
+            merge_area = self.spatial_merge_size * self.spatial_merge_size
+            for row in rows:
+                merged_tokens = row[0] * row[1] * row[2] // merge_area
+                if total_merged_tokens + merged_tokens > self.image_seq_length:
+                    continue
+                capped_rows.append(row)
+                total_merged_tokens += merged_tokens
+            rows = capped_rows
+
+        if not rows:
+            return torch.empty((0, 3), dtype=torch.long)
+        return torch.tensor(rows, dtype=torch.long)
+
+    def _sample_seq_length(self, generator):
+        if not self.variable_seq_length:
+            return self.seq_length
+        span = self.max_seq_length - self.min_seq_length + 1
+        return self.min_seq_length + int(torch.randint(span, (1,), generator=generator).item())
+
+    def _cap_grids_to_seq_length(self, image_grid_thw, seq_length):
+        if image_grid_thw.numel() == 0:
+            return image_grid_thw
+        rows = []
+        total_image_tokens = 0
+        merge_area = self.spatial_merge_size * self.spatial_merge_size
+        for row in image_grid_thw.tolist():
+            image_tokens = row[0] * row[1] * row[2] // merge_area
+            # Keep at least one text token. Each image also needs a vision_start token.
+            if total_image_tokens + image_tokens + len(rows) + 1 >= seq_length:
+                continue
+            rows.append(row)
+            total_image_tokens += image_tokens
         if not rows:
             return torch.empty((0, 3), dtype=torch.long)
         return torch.tensor(rows, dtype=torch.long)
@@ -149,19 +227,47 @@ class MockQwen35VLDataset(Dataset):
     def __len__(self):
         return self.num_samples
 
+    def collate_fn(self, batch):
+        """Collate mock samples while preserving full-iteration CUDA graph input shape rules."""
+        try:
+            from megatron.training import get_args
+
+            args = get_args()
+            use_vanilla_collate = bool(getattr(args, "use_vanilla_collate_fn", False))
+            full_iteration_graph = getattr(args, "cuda_graph_impl", "none") == "full_iteration"
+        except AssertionError:
+            use_vanilla_collate = False
+            full_iteration_graph = False
+
+        if full_iteration_graph:
+            if self.variable_images or self.variable_seq_length:
+                raise ValueError(
+                    "Full-iteration CUDA graph requires a top-level dict with static tensor "
+                    "shapes. mock_variable_images/mock_variable_seq_length currently emit "
+                    "variable pixel/grid/token shapes and need an explicit padding or "
+                    "bucketing contract before they can be captured."
+                )
+            return mock_collate_fn(batch)
+
+        if use_vanilla_collate:
+            return batch
+        return mock_collate_fn(batch)
+
     def __getitem__(self, idx):
         generator = self._generator_for_idx(idx)
         image_grid_thw = self._sample_grids(idx, generator)
+        seq_length = self._sample_seq_length(generator)
+        image_grid_thw = self._cap_grids_to_seq_length(image_grid_thw, seq_length)
         patch_counts = image_grid_thw.prod(dim=1) if image_grid_thw.numel() else torch.zeros(0)
         merged_counts = patch_counts // (self.spatial_merge_size * self.spatial_merge_size)
         image_seq_length = int(merged_counts.sum().item())
 
         # Reserve 1 slot for the vision_start sentinel before image tokens.
-        text_length = self.seq_length - image_seq_length - image_grid_thw.shape[0]
+        text_length = seq_length - image_seq_length - image_grid_thw.shape[0]
         if text_length <= 0:
             raise ValueError(
                 "Mock visual tokens exceed total sequence length: "
-                f"seq_length={self.seq_length}, image_tokens={image_seq_length}, "
+                f"seq_length={seq_length}, image_tokens={image_seq_length}, "
                 f"num_images={image_grid_thw.shape[0]}"
             )
         text_tokens = torch.randint(
@@ -221,11 +327,11 @@ class MockQwen35VLDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
-            "cu_seqlens": torch.tensor([0, self.seq_length], dtype=torch.int32),
+            "cu_seqlens": torch.tensor([0, seq_length], dtype=torch.int32),
             "cu_seqlens_padded": torch.tensor(
-                [0, self.seq_length], dtype=torch.int32,
+                [0, seq_length], dtype=torch.int32,
             ),
-            "max_seqlen": torch.tensor(self.seq_length, dtype=torch.int32),
+            "max_seqlen": torch.tensor(seq_length, dtype=torch.int32),
             "position_ids": position_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
@@ -264,8 +370,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         min_images_per_sample=getattr(args, "mock_min_images_per_sample", 1),
         max_images_per_sample=getattr(args, "mock_max_images_per_sample", 3),
         image_size_choices=getattr(args, "mock_image_size_choices", "224,448"),
+        image_size_weights=getattr(args, "mock_image_size_weights", None),
         image_count_weights=getattr(args, "mock_image_count_weights", None),
         random_seed=getattr(args, "mock_random_seed", 1234),
+        variable_seq_length=getattr(args, "mock_variable_seq_length", False),
+        min_seq_length=getattr(args, "mock_min_seq_length", None),
+        max_seq_length=getattr(args, "mock_max_seq_length", None),
     )
 
     train_ds = MockQwen35VLDataset(
