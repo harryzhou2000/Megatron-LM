@@ -491,18 +491,17 @@ else:
 
 
 try:
-    import inspect
-
+    import hybrid_ep_cpp
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
-    # Check if the installed HybridEPBuffer supports dense_routing mode,
-    # which passes topk_idx directly as int16 instead of a bool routing_map.
+    # Check if the installed HybridEP supports dense topk_idx metadata. Newer
+    # HybridEP infers dense routing from topk_idx when routing_map is omitted.
     try:
-        _sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
-        HAVE_HYBRIDEP_DENSE_ROUTING = "dense_routing" in _sig.parameters
-        del _sig
-    except (ValueError, TypeError):
+        HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(
+            hybrid_ep_cpp.HybridEpConfigInstance(), "topk"
+        )
+    except (ValueError, TypeError, AttributeError):
         HAVE_HYBRIDEP_DENSE_ROUTING = False
 except ImportError:
     HAVE_HYBRIDEP = False
@@ -658,7 +657,7 @@ class HybridEPDispatch(torch.autograd.Function):
         if topk_idx is not None and not HAVE_HYBRIDEP_DENSE_ROUTING:
             raise RuntimeError(
                 "HybridEP topk_idx was provided, but the installed HybridEPBuffer does not "
-                "support dense_routing. Use a newer HybridEP backend or pass a sparse "
+                "support dense topk_idx metadata. Use a newer HybridEP backend or pass a sparse "
                 "routing_map without topk_idx."
             )
 
@@ -684,7 +683,6 @@ class HybridEPDispatch(torch.autograd.Function):
                 pad_multiple=pad_multiple,
                 num_permuted_tokens=num_permuted_tokens,
                 non_blocking=non_blocking,
-                dense_routing=True,
                 **({"fuse_permute_dispatch": fused} if fused else {}),
             )
         else:
