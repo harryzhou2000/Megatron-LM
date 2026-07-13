@@ -1115,7 +1115,7 @@ class _HybridEPManager(_DispatchManager):
             if not HAVE_HYBRIDEP_DENSE_ROUTING:
                 raise RuntimeError(
                     "HybridEP dense routing map was provided, but the installed HybridEPBuffer "
-                    "does not support dense_routing. Use a newer HybridEP backend or disable "
+                    "does not support dense topk_idx metadata. Use a newer HybridEP backend or disable "
                     "dense routing before this dispatcher path."
                 )
             self.routing_map = None

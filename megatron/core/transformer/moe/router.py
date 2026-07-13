@@ -397,7 +397,7 @@ class TopKRouter(Router):
             if not HAVE_HYBRIDEP_DENSE_ROUTING:
                 _debug_dense_routing_disabled(
                     "moe_flex_dispatcher_backend='hybridep' but installed deep_ep "
-                    "HybridEPBuffer.dispatch_with_permute does not expose dense_routing"
+                    "does not support dense topk_idx metadata"
                 )
                 return None
             dense_num_experts = self.tp_group.size() * self.config.num_moe_experts
