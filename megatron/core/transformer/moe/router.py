@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+
 @dataclass(frozen=True)
 class _AuxLossGroupConfig:
     """Process groups for local aux/seq-aux loss and its metric logging."""
