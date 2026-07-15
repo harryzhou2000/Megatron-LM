@@ -330,6 +330,7 @@ def _apply_rotary_pos_emb_thd(
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
+    start_positions: Optional[Tensor] = None,
 ) -> Tensor:
     """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
 
@@ -401,7 +402,9 @@ def _apply_rotary_pos_emb_thd(
         "detection does not silently depend on tensor shape heuristics."
     )
     exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
-    if exact_packed_freqs:
+    if start_positions is not None:
+        freq_pos = freq_pos + start_positions.to(torch.int64)[seq_idx]
+    elif exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token
         # samples its absolute position. When `freqs` only spans one max-len
@@ -650,6 +653,7 @@ def apply_rotary_pos_emb(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     max_seqlen: Optional[int] = None,
+    start_positions: Optional[Tensor] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -783,6 +787,7 @@ def apply_rotary_pos_emb(
                 t,
                 cu_seqlens,
                 freqs,
+                start_positions=start_positions,
                 cp_size=cp_group.size(),
                 cp_rank=cp_group.rank(),
                 interleaved=config.rotary_interleaved,
@@ -813,6 +818,7 @@ def apply_rotary_pos_emb(
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
+            start_positions=start_positions,
         )
 
 
