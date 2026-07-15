@@ -80,7 +80,9 @@ def test_set_cudagraph_attr_supports_nested_paths():
 
 def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(moe_hybridep_pad_variable_tokens=True)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=True, moe_hybridep_use_dense_routing_map=False
+    )
     manager.group = object()
     manager.num_experts = 2
     manager.moe_expert_rank_capacity_factor = None
