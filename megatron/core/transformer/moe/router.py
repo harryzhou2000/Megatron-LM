@@ -95,6 +95,7 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
+        self.expt_tp_group = pg_collection.expt_tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
@@ -431,12 +432,12 @@ class TopKRouter(Router):
                     "does not support dense topk_idx metadata"
                 )
                 return None
-            dense_num_experts = self.tp_group.size() * self.config.num_moe_experts
+            dense_num_experts = self.expt_tp_group.size() * self.config.num_moe_experts
             if dense_num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
                 return torch.int16
             _debug_dense_routing_disabled(
                 "moe_flex_dispatcher_backend='hybridep' but dense expert id range does not fit "
-                f"int16: tp_group_size={self.tp_group.size()} "
+                f"int16: expert_tp_group_size={self.expt_tp_group.size()} "
                 f"num_moe_experts={self.config.num_moe_experts} "
                 f"dense_num_experts={dense_num_experts} "
                 f"int16_expert_limit={_HYBRIDEP_INT16_EXPERT_LIMIT}"
