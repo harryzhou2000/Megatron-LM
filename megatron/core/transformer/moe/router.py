@@ -944,7 +944,10 @@ class TopKRouter(Router):
         if padding_mask is not None and use_dropless_hybridep:
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
-            routing_map = routing_map & valid_tokens
+            if routing_map.dtype == torch.bool:
+                routing_map = routing_map & valid_tokens
+            else:
+                routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

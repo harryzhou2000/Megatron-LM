@@ -177,17 +177,23 @@ class TestTop2Router:
                 seq_len * batch_size,
                 self.router.config.num_moe_experts,
             )
-            assert routing_map_with_mask.shape == (
-                seq_len * batch_size,
-                self.router.config.num_moe_experts,
+            expected_route_width = (
+                self.router.config.num_moe_experts
+                if routing_map_with_mask.dtype == torch.bool
+                else self.router.topk
             )
+            assert routing_map_with_mask.shape == (seq_len * batch_size, expected_route_width)
 
             padding_rows = padding_mask.reshape(-1)
             assert torch.count_nonzero(probs_with_mask[padding_rows]) == 0
-            assert not routing_map_with_mask[padding_rows].any()
+            if routing_map_with_mask.dtype == torch.bool:
+                assert not routing_map_with_mask[padding_rows].any()
+            else:
+                assert torch.all(routing_map_with_mask[padding_rows] == -1)
 
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)
+            assert torch.equal(routing_map_with_mask[~padding_rows], routing_map_without_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
