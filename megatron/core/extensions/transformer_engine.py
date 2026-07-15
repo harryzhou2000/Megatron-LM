@@ -3253,10 +3253,55 @@ try:
 
             return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
 
+    def _localize_thd_rope_for_cp(
+        t: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        freqs: torch.Tensor,
+        start_positions: torch.Tensor,
+        cp_size: int,
+        cp_rank: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build CP-local exact frequencies so fused THD RoPE can run with cp_size=1.
+
+        Transformer Engine's fused THD training path does not support combining
+        non-null start_positions with cp_size > 1: TE's own fused-QKV RoPE tests
+        skip that combination and direct single-tensor THD use produces incorrect
+        gradients.  We preserve the same frequency mapping by materializing this
+        CP rank's local frequency table and then invoking the fused kernel as a
+        local SBHD batch, where start offsets and CP remapping are no longer
+        needed by the kernel.
+        """
+        cu_seqlens_i64 = cu_seqlens.to(torch.int64)
+        global_seq_lens = cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]
+        local_seq_lens = global_seq_lens // cp_size
+        local_cu_seqlens_i64 = F.pad(local_seq_lens.cumsum(dim=0), (1, 0), value=0)
+        local_cu_seqlens = local_cu_seqlens_i64.to(dtype=cu_seqlens.dtype)
+
+        token_pos = torch.arange(t.shape[0], device=t.device, dtype=torch.int64)
+        seq_idx = torch.searchsorted(local_cu_seqlens_i64, token_pos, right=True) - 1
+        seq_idx = seq_idx.clamp(min=0, max=local_seq_lens.shape[0] - 1)
+
+        local_seq_start = local_cu_seqlens_i64[seq_idx]
+        local_pos = token_pos - local_seq_start
+        local_seq_len = local_seq_lens[seq_idx]
+        cp_seg = local_seq_len // 2
+        full_seqlen = local_seq_len * cp_size
+        is_first_half = local_pos < cp_seg
+        freq_pos = torch.where(
+            is_first_half,
+            cp_rank * cp_seg + local_pos,
+            full_seqlen - (cp_rank + 1) * cp_seg + (local_pos - cp_seg),
+        )
+        freq_pos = freq_pos + start_positions.to(torch.int64)[seq_idx]
+        freq_pos = freq_pos.clamp(min=0, max=freqs.shape[0] - 1)
+
+        return freqs[freq_pos].contiguous(), local_cu_seqlens, local_cu_seqlens[:-1]
+
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
         cu_seqlens: torch.Tensor,
         freqs: torch.Tensor,
+        start_positions: Optional[torch.Tensor] = None,
         cp_size: int = 1,
         cp_rank: int = 0,
         interleaved: bool = False,
@@ -3267,10 +3312,19 @@ try:
         if interleaved:
             assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
 
+        if start_positions is not None and cp_size > 1:
+            freqs, _, _ = _localize_thd_rope_for_cp(
+                t, cu_seqlens, freqs, start_positions, cp_size, cp_rank
+            )
+            return apply_rotary_pos_emb(
+                t.unsqueeze(1), freqs, tensor_format="sbhd", fused=True, interleaved=interleaved
+            ).squeeze(1)
+
         if is_te_min_version("2.3.0", check_equality=True):
             return apply_rotary_pos_emb(
                 t,
                 freqs,
+                start_positions=start_positions,
                 tensor_format="thd",
                 fused=True,
                 cu_seqlens=cu_seqlens,
@@ -3282,6 +3336,7 @@ try:
             return apply_rotary_pos_emb(
                 t,
                 freqs,
+                start_positions=start_positions,
                 tensor_format="thd",
                 fused=True,
                 cu_seqlens=cu_seqlens,
@@ -3291,7 +3346,12 @@ try:
         else:
             assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
             return apply_rotary_pos_emb(
-                t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens
+                t,
+                freqs,
+                start_positions=start_positions,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
             )
 
 except ImportError:
