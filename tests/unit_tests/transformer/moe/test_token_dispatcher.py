@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+    _HybridEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -108,6 +113,40 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=False, moe_hybridep_use_dense_routing_map=True
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    routing_map = torch.tensor([[True, False], [False, False]])
+    probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
+
+
+def test_flex_dense_metadata_preserves_invalid_routes():
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size = 2
+    dispatcher.ep_size = 2
+    dispatcher.num_local_experts = 2
+    routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
+    probs = torch.ones((2, 4))
+
+    expanded_routes, _ = dispatcher._initialize_metadata(routing_map, probs)
+
+    expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
+    assert torch.equal(expanded_routes, expected)
 
 
 class MoEModelTestContainer:

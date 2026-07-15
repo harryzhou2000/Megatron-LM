@@ -59,6 +59,7 @@ def _debug_dense_routing_print(message: str) -> None:
             return
     print(message, flush=True)
 
+
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size
@@ -1166,18 +1167,12 @@ class _HybridEPManager(_DispatchManager):
             if self.num_experts > _HYBRIDEP_INT16_EXPERT_LIMIT:
                 self.topk_idx = None
             else:
-                _, self.topk_idx = torch.topk(
-                    self.token_probs, self.router_topk, dim=-1
-                )
+                _, self.topk_idx = torch.topk(self.token_probs, self.router_topk, dim=-1)
                 self.topk_idx = self.topk_idx.to(torch.int16)
-                if self.capacity_factor is not None:
-                    mask = self.token_probs.gather(1, self.topk_idx.long()) == 0
-                    self.topk_idx = self.topk_idx.masked_fill(mask, -1)
-                if padded_num_tokens > num_tokens:
-                    self.topk_idx[num_tokens:padded_num_tokens] = -1
+                invalid_routes = ~self.routing_map.gather(1, self.topk_idx.long())
+                self.topk_idx = self.topk_idx.masked_fill(invalid_routes, -1)
         else:
             self.topk_idx = None
-
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
@@ -1763,20 +1758,18 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             ).contiguous()
         else:
             topk_indices = routing_map.long()
+            invalid_routes = topk_indices < 0
             expert_parallel_idx = topk_indices // self.num_local_experts
             local_expert_idx = topk_indices % self.num_local_experts
             tensor_parallel_idx = torch.arange(
                 self.tp_size, device=routing_map.device, dtype=topk_indices.dtype
             ).view(1, 1, self.tp_size)
+            expanded_indices = (
+                expert_parallel_idx.unsqueeze(-1) * self.tp_size + tensor_parallel_idx
+            ) * self.num_local_experts + local_expert_idx.unsqueeze(-1)
+            expanded_indices = expanded_indices.masked_fill(invalid_routes.unsqueeze(-1), -1)
             routing_map = (
-                (
-                    (expert_parallel_idx.unsqueeze(-1) * self.tp_size + tensor_parallel_idx)
-                    * self.num_local_experts
-                    + local_expert_idx.unsqueeze(-1)
-                )
-                .reshape(num_local_tokens, -1)
-                .to(routing_map.dtype)
-                .contiguous()
+                expanded_indices.reshape(num_local_tokens, -1).to(routing_map.dtype).contiguous()
             )
         probs = (
             probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
