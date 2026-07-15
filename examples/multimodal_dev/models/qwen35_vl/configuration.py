@@ -126,7 +126,7 @@ def get_qwen35_vl_vision_config(
         activation_func=lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
         bias_activation_fusion=False,
         apply_query_key_layer_scaling=False,
-        apply_rope_fusion=False,
+        apply_rope_fusion=True,
         # Vision RoPE is 2D row/column RoPE.  Represent it as sectioned raw
         # mRoPE with a zero temporal section so the fused mRoPE dispatcher can
         # reuse the same Triton kernel when rope fusion is enabled.
