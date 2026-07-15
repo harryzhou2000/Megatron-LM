@@ -119,7 +119,7 @@ def get_qwen35_vl_vision_config(
         activation_func=lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
         bias_activation_fusion=False,
         apply_query_key_layer_scaling=False,
-        apply_rope_fusion=False,
+        apply_rope_fusion=True,
         bf16=False,
     )
 

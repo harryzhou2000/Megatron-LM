@@ -44,6 +44,14 @@ def _apply_rope_fp32(
 
     orig_dtype = t.dtype
     t_fp32 = t.float()
+    use_fused_thd = (
+        cu_seqlens is not None
+        and config.apply_rope_fusion
+        and mscale == 1.0
+        and not mla_rotary_interleaved
+        and not inverse
+        and not mla_output_remove_interleaving
+    )
 
     if cu_seqlens is None:
         out = _apply_rotary_pos_emb_bshd(
@@ -54,24 +62,40 @@ def _apply_rope_fp32(
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
         )
     else:
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
-            t_fp32,
-            cu_seqlens,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-            inverse=inverse,
-            mla_output_remove_interleaving=mla_output_remove_interleaving,
-            cp_group=cp_group,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
-            max_seqlen=max_seqlen,
-        )
+        exact_packed_freqs = max_seqlen is not None and freqs.size(0) > max_seqlen
+        start_positions = cu_seqlens[:-1] if exact_packed_freqs else None
+        if use_fused_thd:
+            from megatron.core.models.common.embeddings.rope_utils import (
+                fused_apply_rotary_pos_emb_thd,
+            )
+
+            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            out = fused_apply_rotary_pos_emb_thd(
+                t_fp32,
+                cu_seqlens,
+                freqs,
+                start_positions=start_positions,
+                cp_size=cp_group.size(),
+                cp_rank=cp_group.rank(),
+                interleaved=config.rotary_interleaved,
+            )
+        else:
+            out = _apply_rotary_pos_emb_thd(
+                t_fp32,
+                cu_seqlens,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                mla_rotary_interleaved=mla_rotary_interleaved,
+                mscale=mscale,
+                inverse=inverse,
+                mla_output_remove_interleaving=mla_output_remove_interleaving,
+                cp_group=cp_group,
+                max_seqlen=max_seqlen,
+            )
     return out.to(orig_dtype)
 
 
