@@ -491,21 +491,29 @@ else:
 
 
 try:
+    import inspect
+
     import hybrid_ep_cpp
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
-    # Check if the installed HybridEP supports dense topk_idx metadata. Newer
-    # HybridEP infers dense routing from topk_idx when routing_map is omitted.
+    _hybrid_ep_dispatch_with_permute_sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = (
+        "dense_routing" in _hybrid_ep_dispatch_with_permute_sig.parameters
+    )
+    # Check if the installed HybridEP supports dense topk_idx metadata. Older
+    # HybridEP needs an explicit dense_routing=True kwarg, while newer HybridEP
+    # infers dense routing from topk_idx when routing_map is omitted.
     try:
-        HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(
+        HAVE_HYBRIDEP_DENSE_ROUTING = HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING or hasattr(
             hybrid_ep_cpp.HybridEpConfigInstance(), "topk"
         )
     except (ValueError, TypeError, AttributeError):
-        HAVE_HYBRIDEP_DENSE_ROUTING = False
+        HAVE_HYBRIDEP_DENSE_ROUTING = HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING
 except ImportError:
     HAVE_HYBRIDEP = False
     HAVE_HYBRIDEP_DENSE_ROUTING = False
+    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = False
 _hybrid_ep_buffer = None
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
@@ -667,6 +675,7 @@ class HybridEPDispatch(torch.autograd.Function):
             assert num_of_experts is not None, "num_of_experts is required for dense routing"
 
         if use_dense:
+            dense_kwargs = {"dense_routing": True} if HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING else {}
             (
                 dispatched_hidden,
                 dispatched_probs,
@@ -684,6 +693,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_permuted_tokens=num_permuted_tokens,
                 non_blocking=non_blocking,
                 **({"fuse_permute_dispatch": fused} if fused else {}),
+                **dense_kwargs,
             )
         else:
             (
