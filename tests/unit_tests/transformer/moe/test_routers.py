@@ -516,6 +516,64 @@ class TestAuxLossFreeTop2Router:
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_dense_expert_bias_token_counts(self, deterministic):
+        self.router = self.router.cuda()
+        self.router.local_tokens_per_expert.zero_()
+        topk_indices = torch.tensor(
+            [[0, 3], [1, 4], [0, 7], [2, 5]], device="cuda", dtype=torch.int16
+        )
+        padding_mask = torch.tensor([False, True, False, False], device="cuda")
+
+        previous_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            self.router._apply_expert_bias(
+                topk_indices,
+                padding_mask=padding_mask,
+                use_dense_indices=True,
+            )
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic)
+
+        expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.float32)
+        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    def test_fused_dense_routing_with_expert_bias(self):
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "deepep"
+        self.router.local_tokens_per_expert.zero_()
+        self.router.expert_bias.copy_(
+            torch.arange(self.router.config.num_moe_experts, device="cuda", dtype=torch.float32)
+        )
+        hidden_states = torch.randn((4, 2, self.router.config.hidden_size), device="cuda").bfloat16()
+        padding_mask = torch.tensor(
+            [[False, True], [False, False], [True, False], [False, False]], device="cuda"
+        )
+
+        _, topk_indices = self.router(hidden_states, padding_mask=padding_mask)
+
+        assert topk_indices.dtype == torch.int64
+        assert topk_indices.shape == (8, self.router.config.moe_router_topk)
+        expected_topk_indices = torch.tensor([6, 7], device="cuda", dtype=topk_indices.dtype)
+        torch.testing.assert_close(
+            topk_indices.sort(dim=-1).values,
+            expected_topk_indices.expand_as(topk_indices),
+        )
+        expected = torch.bincount(
+            topk_indices[~padding_mask.reshape(-1)].reshape(-1).long(),
+            minlength=self.router.config.num_moe_experts,
+        ).to(torch.float32)
+        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
