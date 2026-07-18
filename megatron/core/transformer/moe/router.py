@@ -406,9 +406,6 @@ class TopKRouter(Router):
                 "the sparse bool routing_map"
             )
             return None
-        if self.enable_expert_bias:
-            _debug_dense_routing_disabled("moe_router_enable_expert_bias=True")
-            return None
         if not fused_topk_with_score_function_supports_topk_indices:
             _debug_dense_routing_disabled(
                 "installed TE fused_topk_with_score_function does not expose topk_indices; "
@@ -819,7 +816,10 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        use_dense_indices: bool = False,
     ):
         """
         Update expert bias and tokens_per_expert
@@ -832,8 +832,21 @@ class TopKRouter(Router):
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                    if use_dense_indices:
+                        routing_map = routing_map[~flat_mask]
+                    else:
+                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
+                if use_dense_indices:
+                    expert_indices = routing_map.reshape(-1).to(torch.long)
+                    token_counts = torch.ones_like(
+                        expert_indices, dtype=self.local_tokens_per_expert.dtype
+                    )
+                    if torch.are_deterministic_algorithms_enabled():
+                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
+                    else:
+                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
+                else:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
@@ -916,6 +929,7 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
+        topk_indices = None
         if self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing but was None. "
@@ -1034,7 +1048,11 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(
+            routing_map,
+            padding_mask=padding_mask,
+            use_dense_indices=topk_indices is not None,
+        )
 
         return probs, routing_map
 
