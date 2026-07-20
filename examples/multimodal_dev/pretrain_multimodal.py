@@ -38,7 +38,39 @@ from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.utils import start_memory_history_recording
+
+
+def _prepare_vision_cuda_graph_args(args):
+    """Enable graph-safe RNG when only the vision tower uses local CUDA graphs."""
+    vision_local_cg = getattr(args, "vision_layer_cuda_graph", False)
+    vision_te_cg = getattr(args, "vision_te_cuda_graph", False)
+    if not vision_local_cg and not vision_te_cg:
+        return
+    if vision_local_cg and vision_te_cg:
+        raise ValueError("--vision-layer-cuda-graph and --vision-te-cuda-graph are mutually exclusive")
+    if getattr(args, "use_megatron_fsdp", False):
+        raise ValueError("vision CUDA graphs are not compatible with Megatron-FSDP")
+    if getattr(args, "recompute_vision", False):
+        raise ValueError("vision CUDA graphs are not compatible with --recompute-vision")
+    missing = [
+        name
+        for name in (
+            "vision_max_packed_tokens",
+            "vision_max_packed_sequences",
+            "vision_max_grid_size",
+        )
+        if getattr(args, name, None) is None
+    ]
+    if missing:
+        missing_flags = ", ".join("--" + name.replace("_", "-") for name in missing)
+        raise ValueError(f"vision CUDA graphs require static vision bucket flags: {missing_flags}")
+    if vision_te_cg and "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""):
+        os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")
+    args.te_rng_tracker = True
+    if vision_local_cg:
+        args._multimodal_language_cuda_graph_impl = getattr(args, "cuda_graph_impl", "none")
+    if vision_te_cg:
+        args._vision_te_cuda_graph_requires_rng = True
 
 
 def model_provider(
@@ -68,6 +100,10 @@ def model_provider(
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
+    if getattr(args, "_multimodal_language_cuda_graph_impl", None) is not None:
+        language_config.cuda_graph_impl = args._multimodal_language_cuda_graph_impl
+        language_config.cuda_graph_modules = []
+        language_config._force_create_cudagraphs = True
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
@@ -79,6 +115,25 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    vision_config.qwen_vision_max_packed_tokens = getattr(
+        args, "vision_max_packed_tokens", None
+    )
+    vision_config.qwen_vision_max_packed_sequences = getattr(
+        args, "vision_max_packed_sequences", None
+    )
+    vision_config.qwen_vision_max_grid_size = getattr(args, "vision_max_grid_size", None)
+    if getattr(args, "vision_layer_cuda_graph", False):
+        vision_config.cuda_graph_impl = "local"
+        vision_config.cuda_graph_modules = []
+    if getattr(args, "vision_te_cuda_graph", False):
+        vision_config.cuda_graph_impl = "transformer_engine"
+        vision_config.cuda_graph_modules = []
+        vision_config.sequence_packing_scheduler = "vision_static"
+        vision_config.max_vision_cuda_graph_seq_length = args.vision_max_packed_tokens
+        vision_config.max_seqlen_per_dp_cp_rank = args.vision_max_grid_size**2
+        vision_config.thd_max_packed_sequences = args.vision_max_packed_sequences
+        vision_config.cuda_graph_static_total_tokens = args.vision_max_packed_tokens
+        vision_config.cuda_graph_static_max_seqlen = args.vision_max_grid_size**2
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
     if getattr(args, "recompute_vision", False):
@@ -152,15 +207,12 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    _prepare_vision_cuda_graph_args(args)
     full_config = pretrain_cfg_container_from_args(args)
-    # training.py enables allocator history only on the config-container MODEL
-    # flow; this entry uses model_provider, so it enables recording itself, and
-    # must stay ahead of pretrain(), which constructs the model.
-    start_memory_history_recording(getattr(full_config, "profiling", None))
     pretrain(
         full_config,
         datasets_provider,
+        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        model_provider=model_provider,
     )
