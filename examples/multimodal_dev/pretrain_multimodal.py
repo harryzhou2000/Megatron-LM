@@ -50,6 +50,9 @@ def _prepare_vision_cuda_graph_args(args):
         # language config to eager in model_provider().
         args._multimodal_language_cuda_graph_impl = "none"
         args.cuda_graph_impl = "local"
+        from megatron.core.transformer.enums import InferenceCudaGraphScope
+
+        args.inference_cuda_graph_scope = InferenceCudaGraphScope.layer
 
 
 def model_provider(
