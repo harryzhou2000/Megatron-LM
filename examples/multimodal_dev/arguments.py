@@ -128,6 +128,44 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--vision-max-packed-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Pad Qwen vision transformer inputs to this fixed total patch-token count. "
+            "This is an opt-in static THD staging aid for CUDA graph experiments."
+        ),
+    )
+    group.add_argument(
+        "--vision-max-packed-sequences",
+        type=int,
+        default=None,
+        help=(
+            "Pad Qwen vision THD cu_seqlens to this fixed number of frame sequences. "
+            "Use with --vision-max-packed-tokens for static graph input metadata; include one "
+            "extra sequence for the dummy padding tail when token padding may be needed."
+        ),
+    )
+    group.add_argument(
+        "--vision-max-grid-size",
+        type=int,
+        default=None,
+        help=(
+            "Fixed maximum Qwen vision patch-grid side used to build graph-friendly position "
+            "and RoPE metadata without per-microbatch CPU shape queries. Set this to the "
+            "largest H/W patch-grid size in the bucket."
+        ),
+    )
+    group.add_argument(
+        "--vision-layer-cuda-graph",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable local layer-wise CUDA graphs for Qwen vision transformer layers only. "
+            "Use with the static vision THD bucket flags."
+        ),
+    )
+    group.add_argument(
         "--hf-processor-path",
         type=str,
         default=None,

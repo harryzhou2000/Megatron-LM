@@ -1316,6 +1316,16 @@ def _build_qwen35_vl_mimo_model(
     )
 
 
+def _prepare_vision_cuda_graph_args(args):
+    """Enable graph-safe RNG when only the vision tower uses local CUDA graphs."""
+    if not getattr(args, "vision_layer_cuda_graph", False):
+        return
+    args.te_rng_tracker = True
+    if getattr(args, "cuda_graph_impl", "none") == "none":
+        args._multimodal_language_cuda_graph_impl = "none"
+        args.cuda_graph_impl = "local"
+
+
 def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
     """Build a Qwen3.5-VL MIMO model from normal multimodal_dev args."""
     args = get_args()
@@ -1324,6 +1334,9 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
         raise ValueError("pretrain_multimodal_mimo currently supports only --model-arch qwen35_vl")
 
     language_config = core_transformer_config_from_args(args)
+    if getattr(args, "_multimodal_language_cuda_graph_impl", None) is not None:
+        language_config.cuda_graph_impl = args._multimodal_language_cuda_graph_impl
+        language_config.cuda_graph_modules = []
     post_language_config(language_config, args)
 
     vision_config = get_qwen35_vl_vision_config(
@@ -1332,6 +1345,16 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    vision_config.qwen_vision_max_packed_tokens = getattr(
+        args, "vision_max_packed_tokens", None
+    )
+    vision_config.qwen_vision_max_packed_sequences = getattr(
+        args, "vision_max_packed_sequences", None
+    )
+    vision_config.qwen_vision_max_grid_size = getattr(args, "vision_max_grid_size", None)
+    if getattr(args, "vision_layer_cuda_graph", False):
+        vision_config.cuda_graph_impl = "local"
+        vision_config.cuda_graph_modules = []
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
         vision_config.recompute_method = "uniform"
@@ -1410,6 +1433,7 @@ if __name__ == "__main__":
     if args.context_parallel_size > 1:
         raise ValueError("pretrain_multimodal_mimo currently supports only CP=1")
 
+    _prepare_vision_cuda_graph_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config, datasets_provider, model_provider, ModelType.encoder_or_decoder, forward_step

@@ -26,15 +26,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.models.common.vision_module.vision_module import (
-    VisionModule,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -327,9 +322,7 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from examples.multimodal_dev.models.qwen35_vl.specs import (
-                get_qwen35_vl_vision_spec,
-            )
+            from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         self.decoder = TransformerBlock(
@@ -449,6 +442,95 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         return torch.cat(result)
 
+    def _packed_token_metadata(
+        self,
+        grid_thw: Tensor,
+        total_tokens: int,
+        real_total_tokens: int,
+    ):
+        """Return per-token image-local row/col coordinates for packed vision tokens."""
+        device = grid_thw.device
+        image_lens = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+        image_cu = F.pad(image_lens.cumsum(dim=0, dtype=torch.long), (1, 0), value=0)
+        token_pos = torch.arange(total_tokens, device=device, dtype=torch.long)
+        valid = token_pos < int(real_total_tokens)
+        safe_pos = torch.minimum(
+            token_pos,
+            token_pos.new_full((), max(int(real_total_tokens) - 1, 0)),
+        )
+        image_idx = torch.searchsorted(image_cu, safe_pos, right=True) - 1
+        image_idx = image_idx.clamp(min=0, max=grid_thw.shape[0] - 1)
+
+        height = grid_thw[image_idx, 1].long()
+        width = grid_thw[image_idx, 2].long()
+        spatial_tokens = height * width
+        local_pos = token_pos - image_cu[image_idx]
+        spatial_pos = torch.remainder(local_pos, spatial_tokens.clamp(min=1))
+
+        merge = int(self.spatial_merge_size)
+        merge_area = merge * merge
+        merged_w = (width // merge).clamp(min=1)
+        block_idx = spatial_pos // merge_area
+        intra_idx = spatial_pos % merge_area
+        row = (block_idx // merged_w) * merge + intra_idx // merge
+        col = (block_idx % merged_w) * merge + intra_idx % merge
+        row = row.masked_fill(~valid, 0)
+        col = col.masked_fill(~valid, 0)
+        return row, col, height, width, valid
+
+    @staticmethod
+    def _pad_grid_thw(grid_thw: Tensor, max_num_rows: Optional[int]) -> Tensor:
+        """Pad image grid metadata rows with zero-sized dummy images."""
+        if max_num_rows is None:
+            return grid_thw
+        if grid_thw.shape[0] > max_num_rows:
+            raise ValueError(
+                f"Qwen vision image metadata rows ({grid_thw.shape[0]}) exceed configured "
+                f"static target ({max_num_rows}). Increase --vision-max-packed-sequences "
+                "or use a larger bucket."
+            )
+        if grid_thw.shape[0] == max_num_rows:
+            return grid_thw
+        pad_shape = (int(max_num_rows) - grid_thw.shape[0], grid_thw.shape[1])
+        return torch.cat((grid_thw, grid_thw.new_zeros(pad_shape)), dim=0)
+
+    def _fast_pos_embed_interpolate_static(
+        self,
+        grid_thw: Tensor,
+        total_tokens: int,
+        real_total_tokens: int,
+    ) -> Tensor:
+        """Vectorized learned position interpolation for static packed vision buckets."""
+        row, col, height, width, valid = self._packed_token_metadata(
+            grid_thw, total_tokens, real_total_tokens
+        )
+        n = self.num_grid_per_side
+        dtype = self.pos_embed.weight.dtype
+
+        h_den = (height - 1).clamp(min=1).to(torch.float32)
+        w_den = (width - 1).clamp(min=1).to(torch.float32)
+        h_pos = row.to(torch.float32) * float(n - 1) / h_den
+        w_pos = col.to(torch.float32) * float(n - 1) / w_den
+
+        h_floor = h_pos.floor().long()
+        w_floor = w_pos.floor().long()
+        h_ceil = (h_floor + 1).clamp(max=n - 1)
+        w_ceil = (w_floor + 1).clamp(max=n - 1)
+        dh = (h_pos - h_floor.to(torch.float32)).to(dtype)
+        dw = (w_pos - w_floor.to(torch.float32)).to(dtype)
+
+        idx00 = h_floor * n + w_floor
+        idx01 = h_floor * n + w_ceil
+        idx10 = h_ceil * n + w_floor
+        idx11 = h_ceil * n + w_ceil
+        out = (
+            self.pos_embed(idx00) * ((1 - dh) * (1 - dw)).unsqueeze(-1)
+            + self.pos_embed(idx01) * ((1 - dh) * dw).unsqueeze(-1)
+            + self.pos_embed(idx10) * (dh * (1 - dw)).unsqueeze(-1)
+            + self.pos_embed(idx11) * (dh * dw).unsqueeze(-1)
+        )
+        return out * valid.to(dtype).unsqueeze(-1)
+
     # ---------------------------------------------------------------
     # 2D Vision RoPE
     # ---------------------------------------------------------------
@@ -522,6 +604,32 @@ class Qwen35VLVisionEncoder(VisionModule):
         embeddings = freq_table[pos_ids]
         embeddings = embeddings.flatten(1)
 
+        return Qwen35VLVisionEncoder._format_rotary_pos_emb(self, embeddings)
+
+    def _compute_rotary_pos_emb_static(
+        self,
+        grid_thw: Tensor,
+        total_tokens: int,
+        real_total_tokens: int,
+        max_grid_size: int,
+    ) -> Tensor:
+        """Vectorized 2D Vision RoPE for static packed vision buckets."""
+        row, col, _, _, valid = self._packed_token_metadata(
+            grid_thw, total_tokens, real_total_tokens
+        )
+        freq_table = self.rot_pos_emb(max_grid_size, device=grid_thw.device)
+        pos_ids = torch.stack((row, col), dim=-1).clamp(max=max_grid_size - 1)
+        embeddings = freq_table[pos_ids].flatten(1)
+        embeddings = embeddings * valid.to(embeddings.dtype).unsqueeze(-1)
+        return Qwen35VLVisionEncoder._format_rotary_pos_emb(self, embeddings)
+
+    def _format_rotary_pos_emb(self, embeddings: Tensor) -> Tensor:
+        """Return legacy 2D RoPE or sectioned raw mRoPE frequencies.
+
+        Merge note: Qi's branch introduced sectioned vision mRoPE inline in
+        ``_compute_rotary_pos_emb``. Keep it as a helper so our static THD
+        path and the dynamic path use the same representation.
+        """
         mrope_section = getattr(self.config, "mrope_section", None)
         if mrope_section is None:
             return embeddings
@@ -534,13 +642,9 @@ class Qwen35VLVisionEncoder(VisionModule):
                 f"got {mrope_section}"
             )
 
-        raw_freqs = embeddings.new_zeros(
-            3, 1, embeddings.shape[0], embeddings.shape[1],
-        )
+        raw_freqs = embeddings.new_zeros(3, 1, embeddings.shape[0], embeddings.shape[1])
         raw_freqs[1, 0, :, :sec_h] = embeddings[:, :sec_h]
-        raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[
-            :, sec_h : sec_h + sec_w
-        ]
+        raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[:, sec_h : sec_h + sec_w]
         return raw_freqs
 
     # ---------------------------------------------------------------
@@ -548,7 +652,45 @@ class Qwen35VLVisionEncoder(VisionModule):
     # ---------------------------------------------------------------
 
     @staticmethod
-    def _build_packed_seq_params(grid_thw: Tensor) -> PackedSeqParams:
+    def _pad_first_dim(tensor: Tensor, target_len: Optional[int]) -> Tensor:
+        """Pad a tensor's leading dimension with zeros to ``target_len``."""
+        if target_len is None:
+            return tensor
+        actual_len = tensor.shape[0]
+        if actual_len > target_len:
+            raise ValueError(
+                f"Qwen vision packed tokens ({actual_len}) exceed configured static target "
+                f"({target_len}). Increase --vision-max-packed-tokens or use a larger bucket."
+            )
+        if actual_len == target_len:
+            return tensor
+        pad_shape = (target_len - actual_len, *tensor.shape[1:])
+        return torch.cat((tensor, tensor.new_zeros(pad_shape)), dim=0)
+
+    @staticmethod
+    def _pad_cu_seqlens(cu_seqlens: Tensor, max_num_sequences: Optional[int]) -> Tensor:
+        """Pad THD cumulative sequence metadata to a fixed number of entries."""
+        if max_num_sequences is None:
+            return cu_seqlens
+        target_entries = int(max_num_sequences) + 1
+        if cu_seqlens.numel() > target_entries:
+            raise ValueError(
+                f"Qwen vision packed sequences ({cu_seqlens.numel() - 1}) exceed configured "
+                f"static target ({max_num_sequences}). Increase --vision-max-packed-sequences "
+                "or use a larger bucket."
+            )
+        if cu_seqlens.numel() == target_entries:
+            return cu_seqlens
+        pad = cu_seqlens[-1:].expand(target_entries - cu_seqlens.numel())
+        return torch.cat((cu_seqlens, pad), dim=0)
+
+    @staticmethod
+    def _build_packed_seq_params(
+        grid_thw: Tensor,
+        max_total_tokens: Optional[int] = None,
+        max_num_sequences: Optional[int] = None,
+        real_total_tokens: Optional[int] = None,
+    ) -> PackedSeqParams:
         """Build ``PackedSeqParams`` from grid dimensions.
 
         Each temporal frame of each image forms a separate sub-sequence
@@ -564,16 +706,42 @@ class Qwen35VLVisionEncoder(VisionModule):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        max_seqlen = int(
-            (grid_thw[:, 1] * grid_thw[:, 2]).max().item()
-        )
+        if max_total_tokens is not None:
+            if real_total_tokens is None:
+                real_total_tokens = int(cu_seqlens[-1].item())
+            if real_total_tokens > max_total_tokens:
+                raise ValueError(
+                    f"Qwen vision packed tokens ({real_total_tokens}) exceed configured static "
+                    f"target ({max_total_tokens}). Increase --vision-max-packed-tokens or use a "
+                    "larger bucket."
+                )
+            if real_total_tokens < max_total_tokens:
+                cu_seqlens = torch.cat(
+                    (
+                        cu_seqlens,
+                        cu_seqlens.new_tensor([int(max_total_tokens)]),
+                    ),
+                    dim=0,
+                )
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(seq_lens.max().item()) if seq_lens.numel() else 0
+            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(cu_seqlens, max_num_sequences)
+            pad_between_seqs = False
+        else:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(seq_lens.max().item()) if seq_lens.numel() else 0
+            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(cu_seqlens, max_num_sequences)
+            pad_between_seqs = None
 
         return PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens if max_total_tokens is not None else None,
+            cu_seqlens_kv_padded=cu_seqlens if max_total_tokens is not None else None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            pad_between_seqs=pad_between_seqs,
         )
 
     # ---------------------------------------------------------------
@@ -595,21 +763,86 @@ class Qwen35VLVisionEncoder(VisionModule):
         Returns:
             ``[total_merged_patches, out_hidden_size]`` visual embeddings.
         """
+        real_patch_tokens = pixel_values.shape[0]
+        max_packed_tokens = getattr(self.config, "qwen_vision_max_packed_tokens", None)
+        max_packed_sequences = getattr(self.config, "qwen_vision_max_packed_sequences", None)
+        max_grid_size = getattr(self.config, "qwen_vision_max_grid_size", None)
+        static_bucket_flags = {
+            "--vision-max-packed-tokens": max_packed_tokens,
+            "--vision-max-packed-sequences": max_packed_sequences,
+            "--vision-max-grid-size": max_grid_size,
+        }
+        static_bucket_enabled = any(value is not None for value in static_bucket_flags.values())
+        if static_bucket_enabled and not all(value is not None for value in static_bucket_flags.values()):
+            missing_flags = ", ".join(
+                name for name, value in static_bucket_flags.items() if value is None
+            )
+            raise ValueError(
+                "Qwen vision static token padding requires all static bucket flags: "
+                f"{missing_flags}."
+            )
+        static_metadata = static_bucket_enabled
+        if static_metadata:
+            expected_patch_tokens = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
+            if real_patch_tokens != expected_patch_tokens:
+                raise ValueError(
+                    f"Qwen vision pixel_values tokens ({real_patch_tokens}) do not match "
+                    f"image_grid_thw token count ({expected_patch_tokens})."
+                )
+            actual_grid_size = int(grid_thw[:, 1:].max().item())
+            if actual_grid_size > int(max_grid_size):
+                raise ValueError(
+                    f"Qwen vision grid size ({actual_grid_size}) exceeds configured static "
+                    f"target ({max_grid_size}). Increase --vision-max-grid-size or use a "
+                    "larger bucket."
+                )
+        static_grid_thw = (
+            self._pad_grid_thw(grid_thw, int(max_packed_sequences))
+            if static_metadata and max_packed_sequences is not None
+            else grid_thw
+        )
+        if max_packed_tokens is not None:
+            merge_area = self.spatial_merge_size ** 2
+            if max_packed_tokens % merge_area != 0:
+                raise ValueError(
+                    "--vision-max-packed-tokens must be divisible by "
+                    f"spatial_merge_size**2 ({merge_area}) so the patch merger remains static."
+                )
+            pixel_values = self._pad_first_dim(pixel_values, int(max_packed_tokens))
+
         # 1. Patch embedding (Conv3d)
         hidden_states = self.patch_embed(pixel_values)
 
         # 2. Learned position embedding (bilinear interpolation)
-        pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
+        if static_metadata:
+            pos_embeds = self._fast_pos_embed_interpolate_static(
+                static_grid_thw, int(max_packed_tokens), real_patch_tokens
+            )
+        else:
+            pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
 
         # 3. 2D Vision RoPE
-        rot_freqs = self._compute_rotary_pos_emb(grid_thw)
+        if static_metadata:
+            rot_freqs = self._compute_rotary_pos_emb_static(
+                static_grid_thw, int(max_packed_tokens), real_patch_tokens, int(max_grid_size)
+            )
+        else:
+            rot_freqs = self._compute_rotary_pos_emb(grid_thw)
+            if max_packed_tokens is not None:
+                hidden_states = self._pad_first_dim(hidden_states, int(max_packed_tokens))
+                rot_freqs = self._pad_first_dim(rot_freqs, int(max_packed_tokens))
         if getattr(self.config, "mrope_section", None) is None:
             emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
             rot_freqs = emb.unsqueeze(1).unsqueeze(1)
 
         # 4. Transformer blocks with PackedSeqParams
-        packed_seq_params = self._build_packed_seq_params(grid_thw)
+        packed_seq_params = self._build_packed_seq_params(
+            static_grid_thw,
+            max_total_tokens=max_packed_tokens,
+            max_num_sequences=max_packed_sequences,
+            real_total_tokens=real_patch_tokens,
+        )
         hidden_states = hidden_states.unsqueeze(1)
         hidden_states = self.decoder(
             hidden_states=hidden_states,
@@ -620,4 +853,7 @@ class Qwen35VLVisionEncoder(VisionModule):
         hidden_states = hidden_states.squeeze(1)
 
         # 5. Patch merger
-        return self.merger(hidden_states)
+        merged = self.merger(hidden_states)
+        if max_packed_tokens is not None:
+            merged = merged[: real_patch_tokens // (self.spatial_merge_size ** 2)]
+        return merged
