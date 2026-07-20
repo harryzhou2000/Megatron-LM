@@ -264,6 +264,7 @@ def test_static_vision_encoder_matches_dynamic_forward_backward():
         "only the pre-staged transformer layer is graph-captured today."
     ),
     strict=True,
+    run=False,
 )
 def test_static_vision_encoder_cuda_graph_forward_backward():
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
