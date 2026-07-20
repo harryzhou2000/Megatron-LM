@@ -45,6 +45,12 @@ from .combined_1f1b import (
 Shape = Union[List[int], torch.Size]
 
 
+def _should_create_cudagraphs(config):
+    return getattr(config, 'cuda_graph_impl', None) == "local" or getattr(
+        config, '_force_create_cudagraphs', False
+    )
+
+
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
@@ -834,7 +840,7 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
+    if _should_create_cudagraphs(config):
         create_cudagraphs()
 
     return forward_data_store
@@ -2207,7 +2213,7 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
+    if _should_create_cudagraphs(config):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
@@ -2647,7 +2653,7 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
+    if _should_create_cudagraphs(config):
         create_cudagraphs()
 
     return forward_data_store
