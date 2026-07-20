@@ -19,6 +19,11 @@ from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    create_cudagraphs,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -57,6 +62,13 @@ def _make_metadata_only_encoder(hidden_size=8, max_num_positions=64):
         encoder.pos_embed.weight.copy_(values.view(max_num_positions, hidden_size) / 1000.0)
     encoder.rot_pos_emb = Qwen35VLVisionRotaryEmbedding(dim=4)
     return encoder
+
+
+def _reset_mcore_cuda_graph_state():
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    _CudagraphGlobalRecord.cudagraph_inference_record = []
+    CudaGraphManager.global_mempool = None
 
 
 def test_static_vision_thd_pads_tokens_and_cu_seqlens():
@@ -394,6 +406,7 @@ class _VisionDecoderGraphWrapper(torch.nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_static_vision_transformer_layer_cuda_graph_forward_backward():
+    _reset_mcore_cuda_graph_state()
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     model_parallel_cuda_manual_seed(
         2028, te_rng_tracker=True, use_cudagraphable_rng=True, force_reset_rng=True
@@ -416,6 +429,8 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
             config.bf16 = True
             config.params_dtype = torch.bfloat16
             config.pipeline_dtype = torch.bfloat16
+        graph_config.cuda_graph_impl = "local"
+        graph_config.cuda_graph_modules = []
         eager_encoder = Qwen35VLVisionEncoder(
             config=eager_config,
             in_channels=3,
@@ -439,24 +454,38 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
         eager_layer = _VisionDecoderGraphWrapper(eager_encoder.decoder, max_seqlen=target_tokens)
         graph_layer = _VisionDecoderGraphWrapper(graph_encoder.decoder, max_seqlen=target_tokens)
 
+        record_hidden = torch.randn(
+            target_tokens, 1, hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        rotary_pos_emb = torch.randn(target_tokens, 1, 1, head_dim, device=device)
+
+        # Match --vision-layer-cuda-graph: first pass records MCore local graph metadata,
+        # then create_cudagraphs() captures, and subsequent passes replay those graphs.
+        record_out = graph_layer(record_hidden, rotary_pos_emb, cu_seqlens)
+        record_out.backward(torch.randn_like(record_out))
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created
+        for layer in graph_encoder.decoder.layers:
+            assert hasattr(layer, "cudagraph_manager")
+            assert len(layer.cudagraph_manager.cudagraph_runners) == 1
+            runner = layer.cudagraph_manager.cudagraph_runners[0]
+            assert runner.cudagraph_created
+            assert runner.fwd_graph is not None
+            assert runner.bwd_graph is not None
+
+        graph_layer.zero_grad(set_to_none=True)
+
         eager_hidden = torch.randn(
             target_tokens, 1, hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True
         )
         graph_hidden = eager_hidden.detach().clone().requires_grad_()
-        rotary_pos_emb = torch.randn(target_tokens, 1, 1, head_dim, device=device)
-
         eager_out = eager_layer(eager_hidden, rotary_pos_emb, cu_seqlens)
         torch.cuda.synchronize()
-        from transformer_engine.pytorch.graph import make_graphed_callables
-
-        graphed_layer = make_graphed_callables(
-            graph_layer, (graph_hidden, rotary_pos_emb, cu_seqlens), num_warmup_iters=3
-        )
-        graph_out = graphed_layer(graph_hidden, rotary_pos_emb, cu_seqlens)
+        graph_out = graph_layer(graph_hidden, rotary_pos_emb, cu_seqlens)
 
         output_diff = (graph_out - eager_out).abs()
         print(
-            "cuda_graph_layer_output "
+            "mcore_local_cuda_graph_layer_output "
             f"max={output_diff.max().item():.6e} mean={output_diff.mean().item():.6e} "
             f"bitwise={torch.equal(graph_out, eager_out)}",
             flush=True,
@@ -469,7 +498,7 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
 
         hidden_grad_diff = (graph_hidden.grad - eager_hidden.grad).abs()
         print(
-            "cuda_graph_layer_hidden_grad "
+            "mcore_local_cuda_graph_layer_hidden_grad "
             f"max={hidden_grad_diff.max().item():.6e} mean={hidden_grad_diff.mean().item():.6e} "
             f"bitwise={torch.equal(graph_hidden.grad, eager_hidden.grad)}",
             flush=True,
@@ -493,10 +522,11 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
                 worst_param = (name, max_diff, mean_diff, bitwise)
             torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-2, atol=5e-2, msg=name)
         print(
-            "cuda_graph_layer_worst_param_grad "
+            "mcore_local_cuda_graph_layer_worst_param_grad "
             f"name={worst_param[0]} max={worst_param[1]:.6e} "
             f"mean={worst_param[2]:.6e} bitwise={worst_param[3]}",
             flush=True,
         )
     finally:
+        _reset_mcore_cuda_graph_state()
         Utils.destroy_model_parallel()
