@@ -1324,6 +1324,9 @@ def _prepare_vision_cuda_graph_args(args):
     if getattr(args, "cuda_graph_impl", "none") == "none":
         args._multimodal_language_cuda_graph_impl = "none"
         args.cuda_graph_impl = "local"
+        from megatron.core.transformer.enums import InferenceCudaGraphScope
+
+        args.inference_cuda_graph_scope = InferenceCudaGraphScope.layer
 
 
 def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
