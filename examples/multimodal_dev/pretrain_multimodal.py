@@ -45,14 +45,7 @@ def _prepare_vision_cuda_graph_args(args):
     if not getattr(args, "vision_layer_cuda_graph", False):
         return
     args.te_rng_tracker = True
-    if getattr(args, "cuda_graph_impl", "none") == "none":
-        # Keep enough global state for graph-safe RNG initialization, then restore
-        # language config to eager in model_provider().
-        args._multimodal_language_cuda_graph_impl = "none"
-        args.cuda_graph_impl = "local"
-        from megatron.core.transformer.enums import InferenceCudaGraphScope
-
-        args.inference_cuda_graph_scope = InferenceCudaGraphScope.layer
+    args._multimodal_language_cuda_graph_impl = getattr(args, "cuda_graph_impl", "none")
 
 
 def model_provider(
@@ -85,6 +78,7 @@ def model_provider(
     if getattr(args, "_multimodal_language_cuda_graph_impl", None) is not None:
         language_config.cuda_graph_impl = args._multimodal_language_cuda_graph_impl
         language_config.cuda_graph_modules = []
+        language_config._force_create_cudagraphs = True
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
