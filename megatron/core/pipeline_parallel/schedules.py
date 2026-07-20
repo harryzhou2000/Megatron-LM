@@ -46,6 +46,8 @@ Shape = Union[List[int], torch.Size]
 
 
 def _should_create_cudagraphs(config):
+    # `_force_create_cudagraphs` is used by multimodal models that graph only an
+    # inner vision tower while keeping the outer/language config eager.
     return getattr(config, 'cuda_graph_impl', None) == "local" or getattr(
         config, '_force_create_cudagraphs', False
     )

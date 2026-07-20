@@ -44,6 +44,22 @@ def _prepare_vision_cuda_graph_args(args):
     """Enable graph-safe RNG when only the vision tower uses local CUDA graphs."""
     if not getattr(args, "vision_layer_cuda_graph", False):
         return
+    if getattr(args, "use_megatron_fsdp", False):
+        raise ValueError("--vision-layer-cuda-graph is not compatible with Megatron-FSDP")
+    if getattr(args, "recompute_vision", False):
+        raise ValueError("--vision-layer-cuda-graph is not compatible with --recompute-vision")
+    missing = [
+        name
+        for name in (
+            "vision_max_packed_tokens",
+            "vision_max_packed_sequences",
+            "vision_max_grid_size",
+        )
+        if getattr(args, name, None) is None
+    ]
+    if missing:
+        missing_flags = ", ".join("--" + name.replace("_", "-") for name in missing)
+        raise ValueError(f"--vision-layer-cuda-graph requires static vision bucket flags: {missing_flags}")
     args.te_rng_tracker = True
     args._multimodal_language_cuda_graph_impl = getattr(args, "cuda_graph_impl", "none")
 

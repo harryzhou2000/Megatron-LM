@@ -98,6 +98,7 @@ def _apply_rope_fp32(
                 mla_output_remove_interleaving=mla_output_remove_interleaving,
                 cp_group=cp_group,
                 max_seqlen=max_seqlen,
+                start_positions=start_positions,
             )
     return out.to(orig_dtype)
 

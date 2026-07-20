@@ -695,16 +695,14 @@ class Qwen35VLVisionEncoder(VisionModule):
                     ),
                     dim=0,
                 )
-            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(
-                cu_seqlens, max_num_sequences
-            )
-            max_seqlen = int(max_total_tokens)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(seq_lens.max().item()) if seq_lens.numel() else 0
+            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(cu_seqlens, max_num_sequences)
             pad_between_seqs = False
         else:
-            max_seqlen = int((grid_thw[:, 1] * grid_thw[:, 2]).max().item())
-            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(
-                cu_seqlens, max_num_sequences
-            )
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(seq_lens.max().item()) if seq_lens.numel() else 0
+            cu_seqlens = Qwen35VLVisionEncoder._pad_cu_seqlens(cu_seqlens, max_num_sequences)
             pad_between_seqs = None
 
         return PackedSeqParams(
@@ -741,6 +739,11 @@ class Qwen35VLVisionEncoder(VisionModule):
         max_packed_tokens = getattr(self.config, "qwen_vision_max_packed_tokens", None)
         max_packed_sequences = getattr(self.config, "qwen_vision_max_packed_sequences", None)
         max_grid_size = getattr(self.config, "qwen_vision_max_grid_size", None)
+        if (max_packed_tokens is None) != (max_grid_size is None):
+            raise ValueError(
+                "Qwen vision static token padding requires both --vision-max-packed-tokens "
+                "and --vision-max-grid-size."
+            )
         static_metadata = max_packed_tokens is not None and max_grid_size is not None
         static_grid_thw = (
             self._pad_grid_thw(grid_thw, int(max_packed_sequences))
