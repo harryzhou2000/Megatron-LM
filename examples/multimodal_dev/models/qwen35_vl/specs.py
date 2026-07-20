@@ -66,7 +66,10 @@ def _apply_rope_fp32(
     else:
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
-        exact_packed_freqs = max_seqlen is not None and freqs.size(0) > max_seqlen
+        # Qwen vision supplies one exact RoPE frequency row per packed patch token.
+        # In static THD mode max_seqlen may be the padded bucket length, so shape
+        # comparisons against max_seqlen are not reliable for detecting this layout.
+        exact_packed_freqs = True
         start_positions = cu_seqlens[:-1] if exact_packed_freqs else None
         if use_fused_thd:
             from megatron.core.models.common.embeddings.rope_utils import (

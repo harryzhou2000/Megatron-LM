@@ -40,6 +40,18 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
+def _prepare_vision_cuda_graph_args(args):
+    """Enable graph-safe RNG when only the vision tower uses local CUDA graphs."""
+    if not getattr(args, "vision_layer_cuda_graph", False):
+        return
+    args.te_rng_tracker = True
+    if getattr(args, "cuda_graph_impl", "none") == "none":
+        # Keep enough global state for graph-safe RNG initialization, then restore
+        # language config to eager in model_provider().
+        args._multimodal_language_cuda_graph_impl = "none"
+        args.cuda_graph_impl = "local"
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -67,6 +79,9 @@ def model_provider(
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
+    if getattr(args, "_multimodal_language_cuda_graph_impl", None) is not None:
+        language_config.cuda_graph_impl = args._multimodal_language_cuda_graph_impl
+        language_config.cuda_graph_modules = []
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
@@ -78,6 +93,16 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    vision_config.qwen_vision_max_packed_tokens = getattr(
+        args, "vision_max_packed_tokens", None
+    )
+    vision_config.qwen_vision_max_packed_sequences = getattr(
+        args, "vision_max_packed_sequences", None
+    )
+    vision_config.qwen_vision_max_grid_size = getattr(args, "vision_max_grid_size", None)
+    if getattr(args, "vision_layer_cuda_graph", False):
+        vision_config.cuda_graph_impl = "local"
+        vision_config.cuda_graph_modules = []
 
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
@@ -150,6 +175,7 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    _prepare_vision_cuda_graph_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,
