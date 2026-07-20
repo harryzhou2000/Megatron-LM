@@ -4,6 +4,7 @@
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -84,8 +85,8 @@ def test_static_vision_thd_pads_tokens_and_cu_seqlens():
     )
 
     assert packed_seq_params.qkv_format == "thd"
-    assert packed_seq_params.max_seqlen_q == target_tokens
-    assert packed_seq_params.max_seqlen_kv == target_tokens
+    assert packed_seq_params.max_seqlen_q == 784
+    assert packed_seq_params.max_seqlen_kv == 784
     assert packed_seq_params.pad_between_seqs is False
     assert torch.equal(
         packed_seq_params.cu_seqlens_q,
@@ -121,8 +122,8 @@ def test_static_vision_thd_metadata_stays_on_gpu_with_fixed_shapes():
     assert packed_seq_params.cu_seqlens_kv_padded.device.type == "cuda"
     assert packed_seq_params.cu_seqlens_q.shape == (max_num_sequences + 1,)
     assert packed_seq_params.cu_seqlens_kv.shape == (max_num_sequences + 1,)
-    assert packed_seq_params.max_seqlen_q == target_tokens
-    assert packed_seq_params.max_seqlen_kv == target_tokens
+    assert packed_seq_params.max_seqlen_q == 784
+    assert packed_seq_params.max_seqlen_kv == 784
     assert packed_seq_params.pad_between_seqs is False
 
     x = torch.ones(real_tokens, 8, device="cuda", dtype=torch.bfloat16)
@@ -150,6 +151,109 @@ def test_static_vision_thd_rejects_small_buckets():
             max_num_sequences=1,
             real_total_tokens=980,
         )
+
+
+def test_static_vision_encoder_rejects_partial_static_bucket_config():
+    encoder = _make_metadata_only_encoder()
+    encoder.config = SimpleNamespace(
+        qwen_vision_max_packed_tokens=64,
+        qwen_vision_max_packed_sequences=None,
+        qwen_vision_max_grid_size=None,
+    )
+    pixel_values = torch.zeros(16, 12)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="vision-max-packed-tokens"):
+        encoder(pixel_values, grid_thw)
+
+
+def test_static_vision_thd_uses_true_max_segment_length():
+    grid_thw = torch.tensor([[2, 14, 14]], dtype=torch.long)
+
+    packed_seq_params = Qwen35VLVisionEncoder._build_packed_seq_params(
+        grid_thw,
+        max_total_tokens=392,
+        max_num_sequences=3,
+        real_total_tokens=392,
+    )
+
+    assert torch.equal(
+        packed_seq_params.cu_seqlens_q, torch.tensor([0, 196, 392, 392], dtype=torch.int32)
+    )
+    assert packed_seq_params.max_seqlen_q == 196
+    assert packed_seq_params.max_seqlen_kv == 196
+
+
+def test_static_vision_thd_dummy_tail_bounds_max_seqlen():
+    grid_thw = torch.tensor([[1, 14, 14]], dtype=torch.long)
+
+    packed_seq_params = Qwen35VLVisionEncoder._build_packed_seq_params(
+        grid_thw,
+        max_total_tokens=392,
+        max_num_sequences=2,
+        real_total_tokens=196,
+    )
+
+    assert torch.equal(
+        packed_seq_params.cu_seqlens_q, torch.tensor([0, 196, 392], dtype=torch.int32)
+    )
+    assert packed_seq_params.max_seqlen_q == 196
+    assert packed_seq_params.max_seqlen_kv == 196
+
+
+def test_vision_layer_cuda_graph_rejects_unsupported_args():
+    from examples.multimodal_dev.pretrain_multimodal import _prepare_vision_cuda_graph_args
+
+    base_kwargs = dict(
+        vision_layer_cuda_graph=True,
+        vision_max_packed_tokens=392,
+        vision_max_packed_sequences=3,
+        vision_max_grid_size=14,
+        cuda_graph_impl="none",
+        te_rng_tracker=False,
+        use_megatron_fsdp=False,
+        recompute_vision=False,
+    )
+
+    with pytest.raises(ValueError, match="Megatron-FSDP"):
+        _prepare_vision_cuda_graph_args(SimpleNamespace(**{**base_kwargs, "use_megatron_fsdp": True}))
+
+    with pytest.raises(ValueError, match="recompute-vision"):
+        _prepare_vision_cuda_graph_args(SimpleNamespace(**{**base_kwargs, "recompute_vision": True}))
+
+    with pytest.raises(ValueError, match="vision-max-grid-size"):
+        _prepare_vision_cuda_graph_args(
+            SimpleNamespace(**{**base_kwargs, "vision_max_grid_size": None})
+        )
+
+    args = SimpleNamespace(**base_kwargs)
+    _prepare_vision_cuda_graph_args(args)
+    assert args.te_rng_tracker is True
+    assert args._multimodal_language_cuda_graph_impl == "none"
+
+
+def test_unfused_qwen_vision_thd_rope_uses_start_positions():
+    from examples.multimodal_dev.models.base import _NO_CP_GROUP
+    from examples.multimodal_dev.models.qwen35_vl.specs import _apply_rope_fp32
+    from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+
+    config = _make_tiny_vision_config()
+    config.apply_rope_fusion = False
+    t = torch.randn(5, 2, 8, dtype=torch.bfloat16)
+    freqs = torch.randn(5, 1, 1, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    out = _apply_rope_fp32(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=_NO_CP_GROUP,
+        max_seqlen=5,
+    )
+    expected = _apply_rotary_pos_emb_bshd(t.float().unsqueeze(1), freqs).squeeze(1).to(t.dtype)
+
+    torch.testing.assert_close(out, expected)
 
 
 def test_static_vision_metadata_matches_dynamic_prefix():

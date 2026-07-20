@@ -3452,7 +3452,17 @@ try:
         """
         cu_seqlens_i64 = cu_seqlens.to(torch.int64)
         global_seq_lens = cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]
+        torch._assert(
+            (global_seq_lens % cp_size == 0).all(),
+            "Fused THD RoPE with start_positions and CP requires each packed sequence length "
+            "to be divisible by cp_size.",
+        )
         local_seq_lens = global_seq_lens // cp_size
+        torch._assert(
+            (local_seq_lens % 2 == 0).all(),
+            "Fused THD RoPE with start_positions and CP requires each CP-local sequence length "
+            "to be even for zigzag CP remapping.",
+        )
         local_cu_seqlens_i64 = F.pad(local_seq_lens.cumsum(dim=0), (1, 0), value=0)
         local_cu_seqlens = local_cu_seqlens_i64.to(dtype=cu_seqlens.dtype)
 

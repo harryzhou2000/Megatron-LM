@@ -221,3 +221,39 @@ def test_fused_thd_rope_with_start_positions_matches_unfused(cp_size):
 
         torch.testing.assert_close(fused_output, unfused_output, rtol=5e-3, atol=5e-3)
         torch.testing.assert_close(fused_grad, unfused_grad, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    rope_utils_module.fused_apply_rotary_pos_emb_thd is None, reason="Fused THD RoPE not available."
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "match"),
+    [
+        ([15], "divisible by cp_size"),
+        ([6], "CP-local sequence length"),
+    ],
+)
+def test_fused_thd_rope_with_start_positions_rejects_unsupported_cp_layout(seq_lens, match):
+    """The CP fallback assumes divisible sequence lengths and even local zigzag chunks."""
+    cu_seqlens = torch.nn.functional.pad(
+        torch.tensor(seq_lens, dtype=torch.int32, device="cuda").cumsum(dim=0), (1, 0), value=0
+    )
+    num_heads = 2
+    head_dim = 16
+    cp_group = FakeCPGroup(size=2, rank=0)
+    total_tokens = int(cu_seqlens[-1].item()) // cp_group.size()
+    t = torch.randn(total_tokens, num_heads, head_dim, device="cuda", dtype=torch.float32)
+    freqs = torch.randn(int(cu_seqlens[-1].item()), 1, 1, head_dim, device="cuda")
+    config = TransformerConfig(num_layers=1, num_attention_heads=num_heads, apply_rope_fusion=True)
+
+    with pytest.raises((AssertionError, RuntimeError), match=match):
+        apply_rotary_pos_emb(
+            t,
+            freqs,
+            config,
+            cu_seqlens=cu_seqlens,
+            cp_group=cp_group,
+            max_seqlen=max(seq_lens),
+            start_positions=cu_seqlens[:-1],
+        )
