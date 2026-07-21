@@ -32,8 +32,6 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-import os
-
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
 from megatron.core.enums import ModelType

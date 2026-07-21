@@ -739,12 +739,35 @@ class Qwen35VLVisionEncoder(VisionModule):
         max_packed_tokens = getattr(self.config, "qwen_vision_max_packed_tokens", None)
         max_packed_sequences = getattr(self.config, "qwen_vision_max_packed_sequences", None)
         max_grid_size = getattr(self.config, "qwen_vision_max_grid_size", None)
-        if (max_packed_tokens is None) != (max_grid_size is None):
-            raise ValueError(
-                "Qwen vision static token padding requires both --vision-max-packed-tokens "
-                "and --vision-max-grid-size."
+        static_bucket_flags = {
+            "--vision-max-packed-tokens": max_packed_tokens,
+            "--vision-max-packed-sequences": max_packed_sequences,
+            "--vision-max-grid-size": max_grid_size,
+        }
+        static_bucket_enabled = any(value is not None for value in static_bucket_flags.values())
+        if static_bucket_enabled and not all(value is not None for value in static_bucket_flags.values()):
+            missing_flags = ", ".join(
+                name for name, value in static_bucket_flags.items() if value is None
             )
-        static_metadata = max_packed_tokens is not None and max_grid_size is not None
+            raise ValueError(
+                "Qwen vision static token padding requires all static bucket flags: "
+                f"{missing_flags}."
+            )
+        static_metadata = static_bucket_enabled
+        if static_metadata:
+            expected_patch_tokens = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
+            if real_patch_tokens != expected_patch_tokens:
+                raise ValueError(
+                    f"Qwen vision pixel_values tokens ({real_patch_tokens}) do not match "
+                    f"image_grid_thw token count ({expected_patch_tokens})."
+                )
+            actual_grid_size = int(grid_thw[:, 1:].max().item())
+            if actual_grid_size > int(max_grid_size):
+                raise ValueError(
+                    f"Qwen vision grid size ({actual_grid_size}) exceeds configured static "
+                    f"target ({max_grid_size}). Increase --vision-max-grid-size or use a "
+                    "larger bucket."
+                )
         static_grid_thw = (
             self._pad_grid_thw(grid_thw, int(max_packed_sequences))
             if static_metadata and max_packed_sequences is not None

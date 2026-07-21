@@ -1448,7 +1448,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 kwargs["input_ids"] = input_ids
         else:
             self._decompose_packed_seq_params_to_kwargs(kwargs)
-            kwargs = {key: value for key, value in kwargs.items() if value is not None}
+            if getattr(self.config, 'qwen_vision_max_packed_tokens', None) is not None:
+                kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None

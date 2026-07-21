@@ -2998,8 +2998,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     * num_model_chunks is always 1 (vision has no virtual pipeline stages).
     * Batch dimension is always 1 (images are concatenated along the sequence
       dimension).
-    * Sample argument generation uses a simple loop (no rotary embeddings or
-      buffer-reuse optimization).
+    * Sample argument generation uses a simple loop (plus Qwen vision THD
+      rotary/static-sequence metadata when requested; no buffer-reuse optimization).
     * _finish_capturing wraps captured graphs to filter None values that arise
       from vision encoder layers returning (output, None), and skips cleanup
       that is handled by the LM decoder helper.
@@ -3116,8 +3116,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         """Generate sample arguments for vision encoder CUDA Graph capturing.
 
         Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
-        and no rotary embeddings (unlike the parent's buffer-reuse
-        optimization). The order and chunk_id_list arguments are
+        and optional Qwen vision THD rotary/static-sequence metadata (unlike
+        the parent's buffer-reuse optimization). The order and chunk_id_list arguments are
         unused because vision has num_model_chunks=1 and does not need
         the pipeline-schedule-aware buffer lifecycle tracking.
 
