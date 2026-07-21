@@ -161,15 +161,57 @@ def test_static_vision_thd_rejects_small_buckets():
 
 def test_static_vision_encoder_rejects_partial_static_bucket_config():
     encoder = _make_metadata_only_encoder()
+    pixel_values = torch.zeros(16, 12)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    partial_configs = [
+        dict(
+            qwen_vision_max_packed_tokens=64,
+            qwen_vision_max_packed_sequences=None,
+            qwen_vision_max_grid_size=4,
+        ),
+        dict(
+            qwen_vision_max_packed_tokens=64,
+            qwen_vision_max_packed_sequences=1,
+            qwen_vision_max_grid_size=None,
+        ),
+        dict(
+            qwen_vision_max_packed_tokens=None,
+            qwen_vision_max_packed_sequences=1,
+            qwen_vision_max_grid_size=4,
+        ),
+    ]
+
+    for config_kwargs in partial_configs:
+        encoder.config = SimpleNamespace(**config_kwargs)
+        with pytest.raises(ValueError, match="static bucket flags"):
+            encoder(pixel_values, grid_thw)
+
+
+def test_static_vision_encoder_rejects_grid_token_mismatch():
+    encoder = _make_metadata_only_encoder()
     encoder.config = SimpleNamespace(
-        qwen_vision_max_packed_tokens=64,
-        qwen_vision_max_packed_sequences=None,
-        qwen_vision_max_grid_size=None,
+        qwen_vision_max_packed_tokens=16,
+        qwen_vision_max_packed_sequences=1,
+        qwen_vision_max_grid_size=4,
+    )
+    pixel_values = torch.zeros(15, 12)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="image_grid_thw token count"):
+        encoder(pixel_values, grid_thw)
+
+
+def test_static_vision_encoder_rejects_small_grid_bucket():
+    encoder = _make_metadata_only_encoder()
+    encoder.config = SimpleNamespace(
+        qwen_vision_max_packed_tokens=16,
+        qwen_vision_max_packed_sequences=1,
+        qwen_vision_max_grid_size=3,
     )
     pixel_values = torch.zeros(16, 12)
     grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
 
-    with pytest.raises(ValueError, match="vision-max-packed-tokens"):
+    with pytest.raises(ValueError, match="vision-max-grid-size"):
         encoder(pixel_values, grid_thw)
 
 
@@ -250,6 +292,23 @@ def test_vision_layer_cuda_graph_rejects_unsupported_args(monkeypatch):
     assert te_args.te_rng_tracker is True
     assert not hasattr(te_args, "_multimodal_language_cuda_graph_impl")
     assert os.environ["NCCL_GRAPH_REGISTER"] == "0"
+
+
+def test_mimo_rejects_vision_te_cuda_graph():
+    from examples.multimodal_dev.pretrain_multimodal_mimo import _prepare_vision_cuda_graph_args
+
+    args = SimpleNamespace(
+        vision_layer_cuda_graph=False,
+        vision_te_cuda_graph=True,
+        vision_max_packed_tokens=392,
+        vision_max_packed_sequences=3,
+        vision_max_grid_size=14,
+        use_megatron_fsdp=False,
+        recompute_vision=False,
+    )
+
+    with pytest.raises(ValueError, match="pretrain_multimodal_mimo"):
+        _prepare_vision_cuda_graph_args(args)
 
 
 def test_unfused_qwen_vision_thd_rope_uses_start_positions():
@@ -478,7 +537,7 @@ def test_qwen_vision_te_cuda_graph_replay_matches_eager():
         )
         helper.create_cudagraphs()
         try:
-            cu_seqlens = torch.tensor([0, 36, target_tokens, target_tokens], dtype=torch.int32, device=device)
+            cu_seqlens = torch.tensor([0, 16, 52, target_tokens], dtype=torch.int32, device=device)
             packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
                 cu_seqlens_q=cu_seqlens,
@@ -514,12 +573,12 @@ def test_qwen_vision_te_cuda_graph_replay_matches_eager():
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
             )
-            torch.testing.assert_close(graph_out, eager_out, rtol=5e-2, atol=5e-2)
+            torch.testing.assert_close(graph_out, eager_out, rtol=5e-3, atol=5e-3)
 
             grad_out = torch.randn_like(eager_out)
             eager_out.backward(grad_out)
             graph_out.backward(grad_out)
-            torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=5e-2, atol=5e-2)
+            torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=5e-3, atol=5e-3)
 
             eager_params = dict(eager_encoder.decoder.named_parameters())
             for name, graph_param in graph_encoder.decoder.named_parameters():
@@ -529,7 +588,7 @@ def test_qwen_vision_te_cuda_graph_replay_matches_eager():
                     continue
                 assert eager_grad is not None, name
                 assert graph_grad is not None, name
-                torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-2, atol=5e-2, msg=name)
+                torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-3, atol=5e-3, msg=name)
         finally:
             if helper.graphs_created():
                 helper.delete_cuda_graphs()
@@ -803,7 +862,8 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
         target_tokens = 256
         hidden_size = 256
         head_dim = 64
-        cu_seqlens = torch.tensor([0, 64, 192, 256], dtype=torch.int32, device=device)
+        record_cu_seqlens = torch.tensor([0, 128, 256, 256], dtype=torch.int32, device=device)
+        replay_cu_seqlens = torch.tensor([0, 64, 192, 256], dtype=torch.int32, device=device)
 
         eager_config = _make_tiny_vision_config()
         graph_config = _make_tiny_vision_config()
@@ -847,7 +907,7 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
 
         # Match --vision-layer-cuda-graph: first pass records MCore local graph metadata,
         # then create_cudagraphs() captures, and subsequent passes replay those graphs.
-        record_out = graph_layer(record_hidden, rotary_pos_emb, cu_seqlens)
+        record_out = graph_layer(record_hidden, rotary_pos_emb, record_cu_seqlens)
         record_out.backward(torch.randn_like(record_out))
         create_cudagraphs()
         assert _CudagraphGlobalRecord.cudagraph_created
@@ -865,9 +925,9 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
             target_tokens, 1, hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True
         )
         graph_hidden = eager_hidden.detach().clone().requires_grad_()
-        eager_out = eager_layer(eager_hidden, rotary_pos_emb, cu_seqlens)
+        eager_out = eager_layer(eager_hidden, rotary_pos_emb, replay_cu_seqlens)
         torch.cuda.synchronize()
-        graph_out = graph_layer(graph_hidden, rotary_pos_emb, cu_seqlens)
+        graph_out = graph_layer(graph_hidden, rotary_pos_emb, replay_cu_seqlens)
 
         output_diff = (graph_out - eager_out).abs()
         print(
@@ -876,7 +936,7 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
             f"bitwise={torch.equal(graph_out, eager_out)}",
             flush=True,
         )
-        torch.testing.assert_close(graph_out, eager_out, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(graph_out, eager_out, rtol=5e-3, atol=5e-3)
 
         grad_out = torch.randn_like(eager_out)
         eager_out.backward(grad_out)
@@ -889,7 +949,7 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
             f"bitwise={torch.equal(graph_hidden.grad, eager_hidden.grad)}",
             flush=True,
         )
-        torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=5e-3, atol=5e-3)
 
         eager_params = dict(eager_layer.named_parameters())
         worst_param = ("", 0.0, 0.0, True)
@@ -906,7 +966,7 @@ def test_static_vision_transformer_layer_cuda_graph_forward_backward():
             bitwise = torch.equal(graph_grad, eager_grad)
             if max_diff > worst_param[1]:
                 worst_param = (name, max_diff, mean_diff, bitwise)
-            torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-2, atol=5e-2, msg=name)
+            torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-3, atol=5e-3, msg=name)
         print(
             "mcore_local_cuda_graph_layer_worst_param_grad "
             f"name={worst_param[0]} max={worst_param[1]:.6e} "
