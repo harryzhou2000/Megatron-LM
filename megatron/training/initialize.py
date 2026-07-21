@@ -102,7 +102,8 @@ def initialize_megatron(
             args.data_parallel_random_init,
             args.te_rng_tracker,
             args.inference_rng_tracker,
-            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            use_cudagraphable_rng=args.cuda_graph_impl != "none"
+            or getattr(args, "_vision_te_cuda_graph_requires_rng", False),
         )
 
         # Setup MoE aux loss scale value.

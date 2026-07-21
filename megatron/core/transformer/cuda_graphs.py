@@ -3145,6 +3145,17 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
 
                 if hasattr(layer, 'get_layer_static_inputs'):
                     static_inputs = layer.get_layer_static_inputs(self.seq_length, 1)
+                    if getattr(self.config, 'qwen_vision_max_packed_tokens', None) is not None:
+                        if not getattr(layer, 'is_moe_layer', False):
+                            static_inputs.pop("padding_mask", None)
+                        static_inputs["rotary_pos_emb"] = torch.zeros(
+                            self.seq_length,
+                            1,
+                            1,
+                            self.config.kv_channels,
+                            dtype=torch.float32,
+                            device='cuda',
+                        )
                     hidden_states = static_inputs.pop('hidden_states', hidden_states)
                     sample_args.append((hidden_states,))
                     sample_kwargs_list.append(static_inputs)

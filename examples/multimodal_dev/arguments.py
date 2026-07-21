@@ -166,6 +166,15 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--vision-te-cuda-graph",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Transformer Engine make_graphed_callables for Qwen vision transformer "
+            "layers only. Use with the static vision THD bucket flags."
+        ),
+    )
+    group.add_argument(
         "--hf-processor-path",
         type=str,
         default=None,

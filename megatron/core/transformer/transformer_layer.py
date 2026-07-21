@@ -1209,17 +1209,35 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
                 # entries. cu_seqlens_q / kv / *_padded all share this layout.
-                max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+                max_T = getattr(
+                    self.config,
+                    'cuda_graph_static_total_tokens',
+                    self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size,
+                )
                 max_num_seqs = self.config.thd_max_packed_sequences
+                max_seq = getattr(self.config, 'cuda_graph_static_max_seqlen', max_T)
+                assert max_num_seqs * max_seq >= max_T, (
+                    "THD CUDA graph static sequence metadata cannot cover the configured token "
+                    f"bucket: max_num_seqs={max_num_seqs}, max_seq={max_seq}, total_tokens={max_T}."
+                )
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
-                cu_seqlens[1:] = max_T
+                if hasattr(self.config, 'cuda_graph_static_total_tokens'):
+                    seq_ends = torch.arange(1, max_num_seqs + 1, dtype=torch.int32, device=device)
+                    seq_ends = seq_ends * int(max_seq)
+                    cu_seqlens[1:] = torch.minimum(
+                        seq_ends, torch.full_like(seq_ends, int(max_T))
+                    )
+                else:
+                    cu_seqlens[1:] = max_T
 
                 static_inputs["cu_seqlens_q"] = cu_seqlens
                 static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
 
-            slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
+            slen_for_mask = getattr(
+                self.config, 'cuda_graph_static_total_tokens', self.config.max_seqlen_per_dp_cp_rank
+            )
             if self.config.sequence_parallel:
                 slen_for_mask //= self.config.tensor_model_parallel_size
             static_inputs["padding_mask"] = torch.zeros(
@@ -1323,7 +1341,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        max_seqlen = getattr(
+            self.config,
+            'cuda_graph_static_max_seqlen',
+            self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size,
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -1426,6 +1448,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 kwargs["input_ids"] = input_ids
         else:
             self._decompose_packed_seq_params_to_kwargs(kwargs)
+            kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
