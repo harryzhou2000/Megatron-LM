@@ -115,7 +115,11 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    VisionTECudaGraphHelper,
+    get_vision_cuda_graph_seq_length,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -4361,6 +4365,8 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
+    cuda_graph_helper = None
+    vision_cuda_graph_helper = None
     if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
@@ -4369,6 +4375,22 @@ def train(
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+        )
+    if getattr(args, "vision_te_cuda_graph", False):
+        try:
+            vision_config = get_attr_wrapped_model(model[0], "vision_config", allow_none=False)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "--vision-te-cuda-graph requires model chunks to expose a non-None "
+                "vision_config attribute."
+            ) from exc
+        vision_cuda_graph_helper = VisionTECudaGraphHelper(
+            model=model,
+            vision_config=vision_config,
+            vision_seq_length=get_vision_cuda_graph_seq_length(vision_config),
+            micro_batch_size=args.micro_batch_size,
+            num_microbatches=get_num_microbatches(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     # Run training iterations till done.
@@ -4449,6 +4471,12 @@ def train(
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
+        if (
+            vision_cuda_graph_helper is not None
+            and not vision_cuda_graph_helper.capture_finished()
+            and iteration - start_iteration == args.cuda_graph_warmup_steps
+        ):
+            vision_cuda_graph_helper.create_cudagraphs()
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
@@ -4781,6 +4809,8 @@ def train(
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
+    if vision_cuda_graph_helper is not None and vision_cuda_graph_helper.graphs_created():
+        vision_cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
     if args.optimizer_cuda_graph:
