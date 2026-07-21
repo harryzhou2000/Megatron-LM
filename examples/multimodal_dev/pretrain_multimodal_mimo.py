@@ -1324,6 +1324,8 @@ def _prepare_vision_cuda_graph_args(args):
         return
     if vision_local_cg and vision_te_cg:
         raise ValueError("--vision-layer-cuda-graph and --vision-te-cuda-graph are mutually exclusive")
+    if vision_te_cg:
+        raise ValueError("--vision-te-cuda-graph is not supported by pretrain_multimodal_mimo yet")
     if getattr(args, "use_megatron_fsdp", False):
         raise ValueError("vision CUDA graphs are not compatible with Megatron-FSDP")
     if getattr(args, "recompute_vision", False):
