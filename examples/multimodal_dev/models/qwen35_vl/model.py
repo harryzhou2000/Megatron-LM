@@ -73,6 +73,7 @@ class Qwen35VLModel(MultimodalModel):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
+        self.vision_config = vision_config
 
         vkw = dict(VISION_KWARGS)
         vkw["spatial_merge_size"] = spatial_merge_size

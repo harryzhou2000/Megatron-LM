@@ -1318,12 +1318,16 @@ def _build_qwen35_vl_mimo_model(
 
 def _prepare_vision_cuda_graph_args(args):
     """Enable graph-safe RNG when only the vision tower uses local CUDA graphs."""
-    if not getattr(args, "vision_layer_cuda_graph", False):
+    vision_local_cg = getattr(args, "vision_layer_cuda_graph", False)
+    vision_te_cg = getattr(args, "vision_te_cuda_graph", False)
+    if not vision_local_cg and not vision_te_cg:
         return
+    if vision_local_cg and vision_te_cg:
+        raise ValueError("--vision-layer-cuda-graph and --vision-te-cuda-graph are mutually exclusive")
     if getattr(args, "use_megatron_fsdp", False):
-        raise ValueError("--vision-layer-cuda-graph is not compatible with Megatron-FSDP")
+        raise ValueError("vision CUDA graphs are not compatible with Megatron-FSDP")
     if getattr(args, "recompute_vision", False):
-        raise ValueError("--vision-layer-cuda-graph is not compatible with --recompute-vision")
+        raise ValueError("vision CUDA graphs are not compatible with --recompute-vision")
     missing = [
         name
         for name in (
@@ -1335,9 +1339,14 @@ def _prepare_vision_cuda_graph_args(args):
     ]
     if missing:
         missing_flags = ", ".join("--" + name.replace("_", "-") for name in missing)
-        raise ValueError(f"--vision-layer-cuda-graph requires static vision bucket flags: {missing_flags}")
+        raise ValueError(f"vision CUDA graphs require static vision bucket flags: {missing_flags}")
+    if vision_te_cg and "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""):
+        os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")
     args.te_rng_tracker = True
-    args._multimodal_language_cuda_graph_impl = getattr(args, "cuda_graph_impl", "none")
+    if vision_local_cg:
+        args._multimodal_language_cuda_graph_impl = getattr(args, "cuda_graph_impl", "none")
+    if vision_te_cg:
+        args._vision_te_cuda_graph_requires_rng = True
 
 
 def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
@@ -1370,6 +1379,15 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     if getattr(args, "vision_layer_cuda_graph", False):
         vision_config.cuda_graph_impl = "local"
         vision_config.cuda_graph_modules = []
+    if getattr(args, "vision_te_cuda_graph", False):
+        vision_config.cuda_graph_impl = "transformer_engine"
+        vision_config.cuda_graph_modules = []
+        vision_config.sequence_packing_scheduler = "vision_static"
+        vision_config.max_vision_cuda_graph_seq_length = args.vision_max_packed_tokens
+        vision_config.max_seqlen_per_dp_cp_rank = args.vision_max_grid_size**2
+        vision_config.thd_max_packed_sequences = args.vision_max_packed_sequences
+        vision_config.cuda_graph_static_total_tokens = args.vision_max_packed_tokens
+        vision_config.cuda_graph_static_max_seqlen = args.vision_max_grid_size**2
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
         vision_config.recompute_method = "uniform"

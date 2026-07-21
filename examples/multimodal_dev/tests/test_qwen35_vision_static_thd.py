@@ -18,10 +18,16 @@ from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
     Qwen35VLVisionEncoder,
     Qwen35VLVisionRotaryEmbedding,
 )
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
+    HAVE_TE_GRAPHS,
     CudaGraphManager,
+    VisionTECudaGraphHelper,
     _CudagraphGlobalRecord,
     create_cudagraphs,
 )
@@ -201,11 +207,12 @@ def test_static_vision_thd_dummy_tail_bounds_max_seqlen():
     assert packed_seq_params.max_seqlen_kv == 196
 
 
-def test_vision_layer_cuda_graph_rejects_unsupported_args():
+def test_vision_layer_cuda_graph_rejects_unsupported_args(monkeypatch):
     from examples.multimodal_dev.pretrain_multimodal import _prepare_vision_cuda_graph_args
 
     base_kwargs = dict(
         vision_layer_cuda_graph=True,
+        vision_te_cuda_graph=False,
         vision_max_packed_tokens=392,
         vision_max_packed_sequences=3,
         vision_max_grid_size=14,
@@ -226,10 +233,23 @@ def test_vision_layer_cuda_graph_rejects_unsupported_args():
             SimpleNamespace(**{**base_kwargs, "vision_max_grid_size": None})
         )
 
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _prepare_vision_cuda_graph_args(SimpleNamespace(**{**base_kwargs, "vision_te_cuda_graph": True}))
+
     args = SimpleNamespace(**base_kwargs)
     _prepare_vision_cuda_graph_args(args)
     assert args.te_rng_tracker is True
     assert args._multimodal_language_cuda_graph_impl == "none"
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NCCL_GRAPH_REGISTER", raising=False)
+    te_args = SimpleNamespace(
+        **{**base_kwargs, "vision_layer_cuda_graph": False, "vision_te_cuda_graph": True}
+    )
+    _prepare_vision_cuda_graph_args(te_args)
+    assert te_args.te_rng_tracker is True
+    assert not hasattr(te_args, "_multimodal_language_cuda_graph_impl")
+    assert os.environ["NCCL_GRAPH_REGISTER"] == "0"
 
 
 def test_unfused_qwen_vision_thd_rope_uses_start_positions():
@@ -254,6 +274,268 @@ def test_unfused_qwen_vision_thd_rope_uses_start_positions():
     expected = _apply_rotary_pos_emb_bshd(t.float().unsqueeze(1), freqs).squeeze(1).to(t.dtype)
 
     torch.testing.assert_close(out, expected)
+
+
+class _VisionOnlyWrapper(torch.nn.Module):
+    def __init__(self, vision_model):
+        super().__init__()
+        self.vision_model = vision_model
+
+    def zero_grad_buffer(self):
+        pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE_GRAPHS, reason="TE make_graphed_callables not available")
+def test_qwen_vision_te_cuda_graph_static_inputs_include_thd_rope():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(2029)
+    try:
+        target_tokens = 64
+        max_grid_size = 6
+        max_sequences = 3
+        config = _make_tiny_vision_config()
+        config.bf16 = True
+        config.params_dtype = torch.bfloat16
+        config.pipeline_dtype = torch.bfloat16
+        config.cuda_graph_impl = "transformer_engine"
+        config.cuda_graph_modules = []
+        config.sequence_packing_scheduler = "vision_static"
+        config.qwen_vision_max_packed_tokens = target_tokens
+        config.qwen_vision_max_packed_sequences = max_sequences
+        config.qwen_vision_max_grid_size = max_grid_size
+        config.max_vision_cuda_graph_seq_length = target_tokens
+        config.max_seqlen_per_dp_cp_rank = max_grid_size**2
+        config.thd_max_packed_sequences = max_sequences
+        config.cuda_graph_static_total_tokens = target_tokens
+        config.cuda_graph_static_max_seqlen = max_grid_size**2
+        encoder = Qwen35VLVisionEncoder(
+            config=config,
+            in_channels=3,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            max_num_positions=64,
+        ).cuda().bfloat16().train()
+        helper = VisionTECudaGraphHelper(
+            model=[_VisionOnlyWrapper(encoder)],
+            vision_config=config,
+            vision_seq_length=target_tokens,
+            micro_batch_size=2,
+            num_microbatches=2,
+        )
+
+        sample_args, sample_kwargs = helper._get_sample_arguments(order=[1, -1])
+
+        assert len(sample_args) == config.num_layers * 2
+        assert len(sample_kwargs) == config.num_layers * 2
+        hidden_states = sample_args[0][0]
+        assert hidden_states.shape == (target_tokens, 1, config.hidden_size)
+        assert hidden_states.dtype == torch.bfloat16
+        kwargs = sample_kwargs[0]
+        assert kwargs["rotary_pos_emb"].shape == (target_tokens, 1, 1, config.kv_channels)
+        assert kwargs["rotary_pos_emb"].dtype == torch.float32
+        assert kwargs["cu_seqlens_q"].shape == (max_sequences + 1,)
+        assert torch.equal(
+            kwargs["cu_seqlens_q"],
+            torch.tensor([0, 36, target_tokens, target_tokens], dtype=torch.int32, device="cuda"),
+        )
+        assert kwargs["cu_seqlens_q_padded"].shape == (max_sequences + 1,)
+        assert "padding_mask" not in kwargs
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE_GRAPHS, reason="TE make_graphed_callables not available")
+def test_qwen_vision_te_cuda_graph_create_delete():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(
+        2030, te_rng_tracker=True, use_cudagraphable_rng=True, force_reset_rng=True
+    )
+    try:
+        target_tokens = 64
+        max_grid_size = 6
+        max_sequences = 3
+        config = _make_tiny_vision_config()
+        config.bf16 = True
+        config.params_dtype = torch.bfloat16
+        config.pipeline_dtype = torch.bfloat16
+        config.cuda_graph_impl = "transformer_engine"
+        config.cuda_graph_modules = []
+        config.sequence_packing_scheduler = "vision_static"
+        config.qwen_vision_max_packed_tokens = target_tokens
+        config.qwen_vision_max_packed_sequences = max_sequences
+        config.qwen_vision_max_grid_size = max_grid_size
+        config.max_vision_cuda_graph_seq_length = target_tokens
+        config.max_seqlen_per_dp_cp_rank = max_grid_size**2
+        config.thd_max_packed_sequences = max_sequences
+        config.cuda_graph_static_total_tokens = target_tokens
+        config.cuda_graph_static_max_seqlen = max_grid_size**2
+        encoder = Qwen35VLVisionEncoder(
+            config=config,
+            in_channels=3,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            max_num_positions=64,
+        ).cuda().bfloat16().train()
+        helper = VisionTECudaGraphHelper(
+            model=[_VisionOnlyWrapper(encoder)],
+            vision_config=config,
+            vision_seq_length=target_tokens,
+            micro_batch_size=2,
+            num_microbatches=1,
+        )
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=2,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+
+        helper.create_cudagraphs()
+        assert helper.graphs_created()
+        for layer in helper.callables:
+            assert len(layer.cuda_graphs) == 1
+        helper.delete_cuda_graphs()
+        assert not helper.graphs_created()
+    finally:
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE_GRAPHS, reason="TE make_graphed_callables not available")
+def test_qwen_vision_te_cuda_graph_replay_matches_eager():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(
+        2031, te_rng_tracker=True, use_cudagraphable_rng=True, force_reset_rng=True
+    )
+    try:
+        torch.manual_seed(2031)
+        device = torch.device("cuda", torch.cuda.current_device())
+        target_tokens = 64
+        max_grid_size = 6
+        max_sequences = 3
+
+        eager_config = _make_tiny_vision_config()
+        graph_config = _make_tiny_vision_config()
+        for config in (eager_config, graph_config):
+            config.bf16 = True
+            config.params_dtype = torch.bfloat16
+            config.pipeline_dtype = torch.bfloat16
+            config.sequence_packing_scheduler = "vision_static"
+            config.qwen_vision_max_packed_tokens = target_tokens
+            config.qwen_vision_max_packed_sequences = max_sequences
+            config.qwen_vision_max_grid_size = max_grid_size
+            config.max_vision_cuda_graph_seq_length = target_tokens
+            config.max_seqlen_per_dp_cp_rank = max_grid_size**2
+            config.thd_max_packed_sequences = max_sequences
+            config.cuda_graph_static_total_tokens = target_tokens
+            config.cuda_graph_static_max_seqlen = max_grid_size**2
+        graph_config.cuda_graph_impl = "transformer_engine"
+        graph_config.cuda_graph_modules = []
+
+        eager_encoder = Qwen35VLVisionEncoder(
+            config=eager_config,
+            in_channels=3,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            max_num_positions=64,
+        ).to(device).bfloat16().train()
+        graph_encoder = Qwen35VLVisionEncoder(
+            config=graph_config,
+            in_channels=3,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            max_num_positions=64,
+        ).to(device).bfloat16().train()
+        graph_encoder.load_state_dict(eager_encoder.state_dict())
+
+        helper = VisionTECudaGraphHelper(
+            model=[_VisionOnlyWrapper(graph_encoder)],
+            vision_config=graph_config,
+            vision_seq_length=target_tokens,
+            micro_batch_size=2,
+            num_microbatches=1,
+        )
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=2,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        helper.create_cudagraphs()
+        try:
+            cu_seqlens = torch.tensor([0, 36, target_tokens, target_tokens], dtype=torch.int32, device=device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens,
+                cu_seqlens_kv_padded=cu_seqlens,
+                max_seqlen_q=max_grid_size**2,
+                max_seqlen_kv=max_grid_size**2,
+                pad_between_seqs=False,
+            )
+            rotary_pos_emb = torch.randn(target_tokens, 1, 1, graph_config.kv_channels, device=device)
+            eager_hidden = torch.randn(
+                target_tokens,
+                1,
+                graph_config.hidden_size,
+                device=device,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            graph_hidden = eager_hidden.detach().clone().requires_grad_()
+            for layer in graph_encoder.decoder.layers:
+                layer.current_microbatch = 0
+
+            eager_out = eager_encoder.decoder(
+                hidden_states=eager_hidden,
+                attention_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+            )
+            graph_out = graph_encoder.decoder(
+                hidden_states=graph_hidden,
+                attention_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+            )
+            torch.testing.assert_close(graph_out, eager_out, rtol=5e-2, atol=5e-2)
+
+            grad_out = torch.randn_like(eager_out)
+            eager_out.backward(grad_out)
+            graph_out.backward(grad_out)
+            torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=5e-2, atol=5e-2)
+
+            eager_params = dict(eager_encoder.decoder.named_parameters())
+            for name, graph_param in graph_encoder.decoder.named_parameters():
+                eager_grad = eager_params[name].grad
+                graph_grad = graph_param.grad
+                if eager_grad is None and graph_grad is None:
+                    continue
+                assert eager_grad is not None, name
+                assert graph_grad is not None, name
+                torch.testing.assert_close(graph_grad, eager_grad, rtol=5e-2, atol=5e-2, msg=name)
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+    finally:
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
 
 
 def test_static_vision_metadata_matches_dynamic_prefix():

@@ -304,7 +304,9 @@ class GraphableMegatronModule(MegatronModule):
             assert (
                 self.config.max_seqlen_per_dp_cp_rank is not None
             ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
-            slen_full = self.config.max_seqlen_per_dp_cp_rank
+            slen_full = getattr(
+                self.config, 'cuda_graph_static_total_tokens', self.config.max_seqlen_per_dp_cp_rank
+            )
             batch = 1
         else:
             # SBHD path: per-rank seq is split by CP and (optionally) by TP under SP.
