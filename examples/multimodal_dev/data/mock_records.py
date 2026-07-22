@@ -19,7 +19,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-
 _VISION_TOKEN_KEYS = (
     "tok_per_image_arr",
     "vision_tokens_per_image",
