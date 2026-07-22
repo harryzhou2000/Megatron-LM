@@ -428,6 +428,7 @@ class MockQwen35VLDataset(Dataset):
             "position_ids": position_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": vision_image_grid_thw,
+            "has_real_vision": torch.tensor(image_grid_thw.numel() > 0, dtype=torch.bool),
         }
 
 
@@ -435,14 +436,20 @@ def mock_collate_fn(batch):
     """Collate: handles position_ids ``[3, S]`` stacking."""
     result = {}
     keys = batch[0].keys()
+    real_vision_indices = [
+        idx for idx, sample in enumerate(batch) if bool(sample.get("has_real_vision", True))
+    ]
+    vision_indices = real_vision_indices or [0]
     for key in keys:
+        if key == "has_real_vision":
+            continue
         tensors = [sample[key] for sample in batch]
         if key == "position_ids":
             result[key] = torch.stack(tensors, dim=1)
         elif key == "image_grid_thw":
-            result[key] = torch.cat(tensors, dim=0)
+            result[key] = torch.cat([batch[idx][key] for idx in vision_indices], dim=0)
         elif key == "pixel_values":
-            result[key] = torch.cat(tensors, dim=0)
+            result[key] = torch.cat([batch[idx][key] for idx in vision_indices], dim=0)
         else:
             result[key] = torch.stack(tensors, dim=0)
     return result
