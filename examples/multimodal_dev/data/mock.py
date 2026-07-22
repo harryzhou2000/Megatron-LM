@@ -7,9 +7,18 @@ tokens with image-token placeholders, random pixel values sized for the
 vision encoder, 3D MRoPE position IDs, and shifted labels.
 """
 
+from collections.abc import Sequence
+
 import torch
 from torch.utils.data import Dataset
 
+from examples.multimodal_dev.data.mock_records import (
+    VisionRecord,
+    cap_visual_token_counts,
+    closest_square_grid,
+    load_vision_records,
+    select_vision_record,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
@@ -33,6 +42,10 @@ class MockQwen35VLDataset(Dataset):
         patch_size: Spatial patch size.
         temporal_patch_size: Temporal patch size.
         spatial_merge_size: Spatial merge factor.
+        vision_distribution: ``"random"`` or ``"empirical_record"`` visual-layout source.
+        vision_records_path: JSON/JSONL statistics path required for empirical records.
+        vision_record_sampling: ``"cycle"`` or ``"with_replacement"`` record selection.
+        vision_records: Optional preloaded empirical records shared by datasets.
     """
 
     def __init__(
@@ -58,6 +71,10 @@ class MockQwen35VLDataset(Dataset):
         variable_seq_length: bool = False,
         min_seq_length: int = None,
         max_seq_length: int = None,
+        vision_distribution: str = "random",
+        vision_records_path: str = None,
+        vision_record_sampling: str = "cycle",
+        vision_records: Sequence[VisionRecord] | None = None,
     ):
         self.num_samples = num_samples
         self.seq_length = seq_length
@@ -73,6 +90,8 @@ class MockQwen35VLDataset(Dataset):
         self.min_images_per_sample = min_images_per_sample
         self.max_images_per_sample = max_images_per_sample
         self.variable_seq_length = variable_seq_length
+        self.vision_distribution = vision_distribution
+        self.vision_record_sampling = vision_record_sampling
         self.min_seq_length = (
             min_seq_length if min_seq_length is not None else max(1, seq_length // 2)
         )
@@ -88,6 +107,30 @@ class MockQwen35VLDataset(Dataset):
                     "mock_max_seq_length cannot exceed total_seq_length; "
                     f"got max_seq_length={self.max_seq_length}, total_seq_length={self.seq_length}"
                 )
+        if self.vision_distribution not in {"random", "empirical_record"}:
+            raise ValueError(
+                "mock_vision_distribution must be 'random' or 'empirical_record', "
+                f"got {self.vision_distribution!r}"
+            )
+        if self.vision_distribution == "empirical_record":
+            if vision_records is not None:
+                self.vision_records = tuple(vision_records)
+            elif vision_records_path:
+                self.vision_records = tuple(load_vision_records(vision_records_path))
+            else:
+                raise ValueError(
+                    "mock_vision_records_path is required when "
+                    "mock_vision_distribution=empirical_record"
+                )
+            if not self.vision_records:
+                raise ValueError("Empirical mock vision records must not be empty")
+            if self.vision_record_sampling not in {"cycle", "with_replacement"}:
+                raise ValueError(
+                    "mock_vision_record_sampling must be 'cycle' or "
+                    f"'with_replacement', got {self.vision_record_sampling!r}"
+                )
+        else:
+            self.vision_records = None
         self.image_size_choices = [
             int(size.strip()) for size in image_size_choices.split(",") if size.strip()
         ]
@@ -137,10 +180,11 @@ class MockQwen35VLDataset(Dataset):
             * (w_patches // spatial_merge_size)
         )
         # Fixed-image mode keeps the historical single-image cap. Variable-image
-        # mode uses this as the per-sample cap for total post-merge image tokens.
+        # and empirical-record modes use this as the per-sample cap for total
+        # post-merge image tokens.
         self.image_seq_length = (
             image_seq_length
-            if variable_images
+            if variable_images or vision_distribution == "empirical_record"
             else min(image_seq_length, self.num_merged_tokens)
         )
         self.total_patches = t_patches * h_patches * w_patches
@@ -151,6 +195,22 @@ class MockQwen35VLDataset(Dataset):
         return generator
 
     def _sample_grids(self, idx, generator):
+        if self.vision_distribution == "empirical_record":
+            record = select_vision_record(
+                self.vision_records,
+                sample_index=idx,
+                sampling=self.vision_record_sampling,
+                random_seed=self.random_seed,
+            )
+            rows = [
+                closest_square_grid(token_count, self.spatial_merge_size)
+                for token_count in cap_visual_token_counts(
+                    record.visual_token_counts, self.image_seq_length
+                )
+            ]
+            if not rows:
+                return torch.empty((0, 3), dtype=torch.long)
+            return torch.tensor(rows, dtype=torch.long)
         if not self.variable_images:
             return self.grid_thw.clone()
         span = self.max_images_per_sample - self.min_images_per_sample + 1
@@ -185,21 +245,27 @@ class MockQwen35VLDataset(Dataset):
                     image_size // self.patch_size,
                 ]
             )
-        if self.variable_images and self.image_seq_length >= 0:
-            capped_rows = []
-            total_merged_tokens = 0
-            merge_area = self.spatial_merge_size * self.spatial_merge_size
-            for row in rows:
-                merged_tokens = row[0] * row[1] * row[2] // merge_area
-                if total_merged_tokens + merged_tokens > self.image_seq_length:
-                    continue
-                capped_rows.append(row)
-                total_merged_tokens += merged_tokens
-            rows = capped_rows
+        return self._cap_grids_to_image_seq_length(rows)
 
-        if not rows:
+    def _cap_grids_to_image_seq_length(self, rows):
+        """Keep image grids within the configured post-merge image-token cap."""
+        if self.image_seq_length < 0 or self.image_seq_length == float("inf"):
+            if not rows:
+                return torch.empty((0, 3), dtype=torch.long)
+            return torch.tensor(rows, dtype=torch.long)
+
+        capped_rows = []
+        total_merged_tokens = 0
+        merge_area = self.spatial_merge_size * self.spatial_merge_size
+        for row in rows:
+            merged_tokens = row[0] * row[1] * row[2] // merge_area
+            if total_merged_tokens + merged_tokens > self.image_seq_length:
+                continue
+            capped_rows.append(row)
+            total_merged_tokens += merged_tokens
+        if not capped_rows:
             return torch.empty((0, 3), dtype=torch.long)
-        return torch.tensor(rows, dtype=torch.long)
+        return torch.tensor(capped_rows, dtype=torch.long)
 
     def _sample_seq_length(self, generator):
         if not self.variable_seq_length:
@@ -240,12 +306,16 @@ class MockQwen35VLDataset(Dataset):
             full_iteration_graph = False
 
         if full_iteration_graph:
-            if self.variable_images or self.variable_seq_length:
+            if (
+                self.variable_images
+                or self.variable_seq_length
+                or self.vision_distribution == "empirical_record"
+            ):
                 raise ValueError(
                     "Full-iteration CUDA graph requires a top-level dict with static tensor "
-                    "shapes. mock_variable_images/mock_variable_seq_length currently emit "
-                    "variable pixel/grid/token shapes and need an explicit padding or "
-                    "bucketing contract before they can be captured."
+                    "shapes. Variable-image, variable-sequence-length, and empirical-record "
+                    "mocks emit variable pixel/grid/token shapes and need an explicit padding "
+                    "or bucketing contract before they can be captured."
                 )
             return mock_collate_fn(batch)
 
@@ -360,6 +430,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     from megatron.training import get_args
 
     args = get_args()
+    vision_distribution = getattr(args, "mock_vision_distribution", "random")
+    vision_records_path = getattr(args, "mock_vision_records_path", None)
+    vision_records = (
+        tuple(load_vision_records(vision_records_path))
+        if vision_distribution == "empirical_record" and vision_records_path
+        else None
+    )
     kwargs = dict(
         seq_length=getattr(args, "total_seq_length", 1024),
         image_seq_length=getattr(args, "image_seq_length", 256),
@@ -376,6 +453,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         variable_seq_length=getattr(args, "mock_variable_seq_length", False),
         min_seq_length=getattr(args, "mock_min_seq_length", None),
         max_seq_length=getattr(args, "mock_max_seq_length", None),
+        vision_distribution=vision_distribution,
+        vision_records_path=vision_records_path,
+        vision_record_sampling=getattr(args, "mock_vision_record_sampling", "cycle"),
+        vision_records=vision_records,
     )
 
     train_ds = MockQwen35VLDataset(
