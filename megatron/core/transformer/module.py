@@ -301,6 +301,8 @@ class GraphableMegatronModule(MegatronModule):
 
         if self._is_thd_cuda_graph():
             # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
+            # Merge note: Qi's branch used generic SBHD sizing here. Keep the
+            # THD-specific static total-token path for Qwen vision buckets.
             assert (
                 self.config.max_seqlen_per_dp_cp_rank is not None
             ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
