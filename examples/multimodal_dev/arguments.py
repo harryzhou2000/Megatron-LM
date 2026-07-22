@@ -2,6 +2,37 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+import argparse
+import math
+
+
+def parse_image_seq_length(value: str) -> int | float:
+    """Parse a non-negative image-token cap or ``inf``.
+
+    ``inf`` disables the image-token cap while the independent total sequence
+    length remains enforced.  Negative values retain the mock dataset's
+    historical no-cap behavior.
+
+    Args:
+        value: Command-line value supplied for ``--image-seq-length``.
+
+    Returns:
+        An integer cap or positive infinity.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``value`` is neither an integer nor
+            an infinity spelling.
+    """
+
+    if value.strip().lower() in {"inf", "+inf", "infinity", "+infinity"}:
+        return math.inf
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"image sequence length must be an integer or 'inf', got {value!r}"
+        ) from exc
+
 
 def add_multimodal_args(parser):
     """Add multimodal-specific arguments to the Megatron argument parser."""
@@ -89,6 +120,36 @@ def add_multimodal_args(parser):
         help="Base seed for deterministic per-sample mock data generation.",
     )
     group.add_argument(
+        "--mock-vision-distribution",
+        type=str,
+        choices=("random", "empirical_record"),
+        default="random",
+        help=(
+            "Visual-layout source for the mock. 'random' uses the existing image-count/size "
+            "sampling; 'empirical_record' replays visual-token records from "
+            "--mock-vision-records-path."
+        ),
+    )
+    group.add_argument(
+        "--mock-vision-records-path",
+        type=str,
+        default=None,
+        help=(
+            "JSON/JSONL file or directory of empirical visual-token records. Required when "
+            "--mock-vision-distribution=empirical_record."
+        ),
+    )
+    group.add_argument(
+        "--mock-vision-record-sampling",
+        type=str,
+        choices=("cycle", "with_replacement"),
+        default="cycle",
+        help=(
+            "Empirical-record selection. 'cycle' preserves exact record frequencies over a "
+            "complete cycle; 'with_replacement' makes deterministic independent draws."
+        ),
+    )
+    group.add_argument(
         "--mock-variable-seq-length",
         action="store_true",
         default=False,
@@ -114,9 +175,9 @@ def add_multimodal_args(parser):
     )
     group.add_argument(
         "--image-seq-length",
-        type=int,
+        type=parse_image_seq_length,
         default=256,
-        help="Number of image tokens in mock data",
+        help="Image-token cap in mock data; use 'inf' to disable this cap.",
     )
     group.add_argument(
         "--vision-num-layers",
