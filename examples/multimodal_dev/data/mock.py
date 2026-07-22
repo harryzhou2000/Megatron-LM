@@ -290,6 +290,13 @@ class MockQwen35VLDataset(Dataset):
             return torch.empty((0, 3), dtype=torch.long)
         return torch.tensor(rows, dtype=torch.long)
 
+    def _dummy_vision_grid(self):
+        """Minimal valid vision grid used to keep eager vision execution non-empty."""
+        return torch.tensor(
+            [[1, self.spatial_merge_size, self.spatial_merge_size]],
+            dtype=torch.long,
+        )
+
     def __len__(self):
         return self.num_samples
 
@@ -311,6 +318,10 @@ class MockQwen35VLDataset(Dataset):
                 or self.variable_seq_length
                 or self.vision_distribution == "empirical_record"
             ):
+                # The pure-text dummy vision row created in __getitem__ is a
+                # dataloader-side eager fallback. It does not make empirical
+                # records full-iteration-graph safe because record replay still
+                # has variable pixel/grid/token shapes before explicit bucketing.
                 raise ValueError(
                     "Full-iteration CUDA graph requires a top-level dict with static tensor "
                     "shapes. Variable-image, variable-sequence-length, and empirical-record "
@@ -328,6 +339,14 @@ class MockQwen35VLDataset(Dataset):
         image_grid_thw = self._sample_grids(idx, generator)
         seq_length = self._sample_seq_length(generator)
         image_grid_thw = self._cap_grids_to_seq_length(image_grid_thw, seq_length)
+        # Keep the language sample logically text-only while giving the eager
+        # vision encoder a non-empty THD sequence. This runs in dataset/sample
+        # construction, outside local/TE vision layer CUDA graph capture. Full
+        # iteration CG rejects empirical records in collate_fn above.
+        real_image_grid_thw = image_grid_thw
+        vision_image_grid_thw = (
+            image_grid_thw if image_grid_thw.numel() else self._dummy_vision_grid()
+        )
         patch_counts = image_grid_thw.prod(dim=1) if image_grid_thw.numel() else torch.zeros(0)
         merged_counts = patch_counts // (self.spatial_merge_size * self.spatial_merge_size)
         image_seq_length = int(merged_counts.sum().item())
@@ -380,7 +399,11 @@ class MockQwen35VLDataset(Dataset):
             * self.patch_size
             * self.patch_size
         )
-        total_patches = int(patch_counts.sum().item())
+        # A pure-text empirical record has no image placeholders to scatter, but
+        # eager Qwen vision currently assumes non-empty THD metadata. Feed a
+        # minimal dummy vision sequence and let masked_scatter ignore its output.
+        vision_patch_counts = vision_image_grid_thw.prod(dim=1)
+        total_patches = int(vision_patch_counts.sum().item())
         pixel_values = torch.randn(total_patches, pixel_dim, generator=generator)
 
         position_ids, _ = get_rope_index(
@@ -389,7 +412,7 @@ class MockQwen35VLDataset(Dataset):
             video_token_id=self.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=real_image_grid_thw,
         )
         position_ids = position_ids.squeeze(1)
 
@@ -404,7 +427,7 @@ class MockQwen35VLDataset(Dataset):
             "max_seqlen": torch.tensor(seq_length, dtype=torch.int32),
             "position_ids": position_ids,
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
+            "image_grid_thw": vision_image_grid_thw,
         }
 
 
