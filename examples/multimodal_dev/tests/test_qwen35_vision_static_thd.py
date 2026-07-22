@@ -61,6 +61,7 @@ def _make_tiny_vision_config() -> TransformerConfig:
 def _make_metadata_only_encoder(hidden_size=8, max_num_positions=64):
     encoder = object.__new__(Qwen35VLVisionEncoder)
     torch.nn.Module.__init__(encoder)
+    encoder.config = SimpleNamespace(mrope_section=None)
     encoder.spatial_merge_size = 2
     encoder.num_grid_per_side = int(max_num_positions**0.5)
     encoder.pos_embed = torch.nn.Embedding(max_num_positions, hidden_size)
