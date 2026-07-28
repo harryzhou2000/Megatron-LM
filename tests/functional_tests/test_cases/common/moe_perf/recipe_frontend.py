@@ -359,7 +359,55 @@ def _quantization_context(config, layer_number: int):
 
 
 def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> float:
-    """Reuse Megatron's training FLOP estimator on a MoE-only args view."""
+    """Compute MoE-only GEMM FLOPs for one frontend iteration."""
+
+    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size, shared_expert_size):
+        # Forward-equivalent FLOPs with FMA factor included. Router, token
+        # permutation, aux loss, elementwise activations, and communication are
+        # intentionally excluded to keep the metric scoped to MoE GEMM work.
+        scale_factor = 3.0 / 2.0 if args.swiglu else 1.0
+        if args.moe_latent_size is None:
+            routed_flops = (
+                4
+                * total_tokens
+                * hidden_size
+                * moe_ffn_hidden_size
+                * args.moe_router_topk
+                * scale_factor
+            )
+        else:
+            routed_flops = (
+                4
+                * total_tokens
+                * args.moe_latent_size
+                * moe_ffn_hidden_size
+                * args.moe_router_topk
+                * scale_factor
+            )
+            # Latent expert up/down projections.
+            routed_flops += 4 * total_tokens * hidden_size * args.moe_latent_size
+        shared_flops = 4 * total_tokens * hidden_size * shared_expert_size * scale_factor
+        return routed_flops + shared_flops
+
+    if layer_specs and layer_specs[0].source != "hybrid":
+        total_tokens = args.micro_batch_size * args.data_parallel_size * args.seq_length
+        moe_ffn_hidden_size = (
+            args.moe_ffn_hidden_size
+            if args.moe_ffn_hidden_size is not None
+            else args.ffn_hidden_size
+        )
+        shared_expert_size = args.moe_shared_expert_intermediate_size or 0
+        forward_backward_expansion_factor = 3
+        return (
+            forward_backward_expansion_factor
+            * len(layer_specs)
+            * moe_layer_flops(
+                total_tokens,
+                args.hidden_size,
+                moe_ffn_hidden_size,
+                shared_expert_size,
+            )
+        )
 
     moe_args = copy.copy(args)
     moe_args.num_layers = len(layer_specs)
