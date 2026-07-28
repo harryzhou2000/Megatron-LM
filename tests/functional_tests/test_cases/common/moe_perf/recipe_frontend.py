@@ -328,6 +328,24 @@ def _zero_layer_grads(module: torch.nn.Module) -> None:
             param.grad_added_to_main_grad = False
 
 
+def _verify_situ_glu_fused_backend(layers: torch.nn.ModuleList) -> None:
+    """Verify TE selected its joint CuTe grouped-MLP op rather than basic-op fallback."""
+    selected = []
+    for layer in layers:
+        experts = layer.mlp.experts
+        fused_sequential = experts._fused_ops[0]
+        for module_group in fused_sequential._module_groups:
+            forward_ops = getattr(module_group, "_forward_ops", ())
+            selected.extend(type(op).__name__ for op, _ in forward_ops)
+    expected = "GroupedMLP_CuTeGEMMGLU"
+    if expected not in selected:
+        raise RuntimeError(
+            "SiTU-GLU requested, but TE did not select the fused MXFP8 "
+            f"FC1 -> SiTU-GLU -> FC2 CuTe DSL op; selected={selected}."
+        )
+    print_rank_0(f"[moe_perf] verified_situ_glu_backend={expected}")
+
+
 def _zero_static_input_grad(hidden_states: torch.Tensor) -> None:
     if hidden_states.grad is not None:
         hidden_states.grad.zero_()
@@ -365,7 +383,7 @@ def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> floa
         # Forward-equivalent FLOPs with FMA factor included. Router, token
         # permutation, aux loss, elementwise activations, and communication are
         # intentionally excluded to keep the metric scoped to MoE GEMM work.
-        scale_factor = 3.0 / 2.0 if args.swiglu else 1.0
+        scale_factor = 3.0 / 2.0 if args.swiglu or args.use_situ_glu else 1.0
         if args.moe_latent_size is None:
             routed_flops = (
                 4
@@ -584,6 +602,8 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
                 backward_grad=backward_grad_template,
                 paged_stash_enabled=paged_stash_enabled,
             )
+        if iteration == 0 and config.use_situ_glu:
+            _verify_situ_glu_fused_backend(layers)
         paged_stash_overflow, paged_stash_host_spill = _check_paged_stash_status(
             paged_stash_enabled
         )
@@ -673,7 +693,10 @@ def main() -> None:
             f"source={layer_specs[0].source} "
             f"count={len(layer_specs)} "
             f"layer_numbers={[spec.layer_number for spec in layer_specs]} "
-            f"force_load_balancing={config.moe_router_force_load_balancing}"
+            f"force_load_balancing={config.moe_router_force_load_balancing} "
+            f"latent_up_rmsnorm={config.moe_latent_up_projection_rmsnorm} "
+            f"situ_glu={config.use_situ_glu} "
+            f"situ_glu_impl={config.situ_glu_impl}"
         )
     layers = _build_moe_layers(layer_specs, config)
     _ensure_main_grad_buffers(layers)
