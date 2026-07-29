@@ -11,7 +11,6 @@ wrappers, or pipeline schedules.
 
 from __future__ import annotations
 
-import copy
 import functools
 import os
 import statistics
@@ -54,7 +53,7 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import set_global_variables
 from megatron.training.initialize import initialize_megatron
-from megatron.training.training import num_floating_point_operations
+from megatron.training.training import _moe_layer_flops
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -498,73 +497,28 @@ def _quantization_context(config, layer_number: int):
 def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> float:
     """Compute MoE-only GEMM FLOPs for one frontend iteration."""
 
-    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size, shared_expert_size):
-        # Forward-equivalent FLOPs with FMA factor included. Router, token
-        # permutation, aux loss, elementwise activations, and communication are
-        # intentionally excluded to keep the metric scoped to MoE GEMM work.
-        scale_factor = 3.0 / 2.0 if args.swiglu or args.use_situ_glu else 1.0
-        if args.moe_latent_size is None:
-            routed_flops = (
-                4
-                * total_tokens
-                * hidden_size
-                * moe_ffn_hidden_size
-                * args.moe_router_topk
-                * scale_factor
-            )
-        else:
-            routed_flops = (
-                4
-                * total_tokens
-                * args.moe_latent_size
-                * moe_ffn_hidden_size
-                * args.moe_router_topk
-                * scale_factor
-            )
-            # Latent expert up/down projections.
-            routed_flops += 4 * total_tokens * hidden_size * args.moe_latent_size
-        shared_flops = 4 * total_tokens * hidden_size * shared_expert_size * scale_factor
-        return routed_flops + shared_flops
-
-    if layer_specs and layer_specs[0].source != "hybrid":
-        total_tokens = args.micro_batch_size * args.data_parallel_size * args.seq_length
-        moe_ffn_hidden_size = (
-            args.moe_ffn_hidden_size
-            if args.moe_ffn_hidden_size is not None
-            else args.ffn_hidden_size
-        )
-        shared_expert_size = args.moe_shared_expert_intermediate_size or 0
-        forward_backward_expansion_factor = 3
-        return (
-            forward_backward_expansion_factor
-            * len(layer_specs)
-            * moe_layer_flops(
-                total_tokens, args.hidden_size, moe_ffn_hidden_size, shared_expert_size
-            )
-        )
-
-    moe_args = copy.copy(args)
-    moe_args.num_layers = len(layer_specs)
-    moe_args.mtp_num_layers = None
-    # This frontend excludes embeddings/output projection/logits. The shared
-    # Hybrid/GPT estimator includes logits as ``hidden_size * padded_vocab_size``;
-    # zero it in this temporary args view to keep the report MoE-only.
-    moe_args.padded_vocab_size = 0
-    if layer_specs and layer_specs[0].source == "hybrid":
-        moe_args.is_hybrid_model = True
-        moe_args.hybrid_layer_pattern = Symbols.MOE * len(layer_specs)
-        moe_args.hybrid_override_pattern = moe_args.hybrid_layer_pattern
-    else:
-        moe_args.is_hybrid_model = False
-        moe_args.hybrid_layer_pattern = None
-        moe_args.hybrid_override_pattern = None
-        moe_args.moe_layer_freq = 1
-
     # The frontend runs exactly one synthetic microbatch per data-parallel rank
-    # per measured iteration. Match training.py's convention, but do not include
-    # gradient-accumulation microbatches that are not executed by this frontend.
-    batch_size = args.micro_batch_size * args.data_parallel_size
-    return num_floating_point_operations(moe_args, batch_size)
+    # per measured iteration. Router, token permutation, aux loss, elementwise
+    # activations, normalization, and communication are intentionally excluded.
+    total_tokens = args.micro_batch_size * args.data_parallel_size * args.seq_length
+    moe_ffn_hidden_size = (
+        args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None else args.ffn_hidden_size
+    )
+    shared_expert_size = args.moe_shared_expert_intermediate_size or 0
+    forward_backward_expansion_factor = 3
+    return (
+        forward_backward_expansion_factor
+        * len(layer_specs)
+        * _moe_layer_flops(
+            total_tokens,
+            args.hidden_size,
+            moe_ffn_hidden_size,
+            shared_expert_size,
+            args.moe_router_topk,
+            args.moe_latent_size,
+            gated_linear_unit=args.swiglu or args.use_situ_glu,
+        )
+    )
 
 
 def _forward_moe_layers(hidden_states, config, layers, layer_specs):
