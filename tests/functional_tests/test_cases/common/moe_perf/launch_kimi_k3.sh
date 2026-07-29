@@ -9,22 +9,38 @@ repo_root="$(cd -- "${script_dir}/../../../../.." && pwd)"
 num_gpus="${NUM_GPUS:-8}"
 expert_parallel_size="${EXPERT_PARALLEL_SIZE:-8}"
 num_experts="${NUM_EXPERTS:-8}"
+router_topk="${ROUTER_TOPK:-1}"
 run_unit_tests="${RUN_UNIT_TESTS:-1}"
 dispatcher_backend="${DISPATCHER_BACKEND:-hybridep}"
+bias_update_method="${BIAS_UPDATE_METHOD:-quantile}"
+qb_num_bins="${QB_NUM_BINS:-1000}"
+full_iter_cuda_graph="${FULL_ITER_CUDA_GRAPH:-0}"
 log_dir="${KIMI_K3_LOG_DIR:-${repo_root}/logs/moe_perf}"
 log_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-log_file="${KIMI_K3_LOG_FILE:-${log_dir}/kimi_k3_${dispatcher_backend}_ep8_${log_timestamp}.log}"
+log_file="${KIMI_K3_LOG_FILE:-${log_dir}/kimi_k3_${dispatcher_backend}_ep${expert_parallel_size}_${bias_update_method}_${log_timestamp}.log}"
 
 mkdir -p "${log_dir}"
 exec > >(tee -a "${log_file}") 2>&1
 echo "[kimi_k3] log_file=${log_file}"
 
-if [[ "${num_gpus}" -ne 8 || "${expert_parallel_size}" -ne 8 ]]; then
-    echo "Kimi K3 distributed validation requires NUM_GPUS=8 and EXPERT_PARALLEL_SIZE=8." >&2
+if [[ "${num_gpus}" -ne "${expert_parallel_size}" ]]; then
+    echo "This no-TP launch requires NUM_GPUS to equal EXPERT_PARALLEL_SIZE." >&2
     exit 2
 fi
 if (( num_experts % expert_parallel_size != 0 )); then
     echo "NUM_EXPERTS must be divisible by EXPERT_PARALLEL_SIZE." >&2
+    exit 2
+fi
+if (( router_topk <= 0 || router_topk >= num_experts )); then
+    echo "ROUTER_TOPK must be greater than zero and less than NUM_EXPERTS." >&2
+    exit 2
+fi
+if [[ "${bias_update_method}" != "quantile" && "${bias_update_method}" != "sign" ]]; then
+    echo "BIAS_UPDATE_METHOD must be 'quantile' or 'sign'." >&2
+    exit 2
+fi
+if (( qb_num_bins <= 0 )); then
+    echo "QB_NUM_BINS must be greater than zero." >&2
     exit 2
 fi
 
@@ -41,7 +57,6 @@ case "${dispatcher_backend}" in
         dispatcher_args=(
             --moe-token-dispatcher-type flex
             --moe-flex-dispatcher-backend hybridep
-            --moe-router-fusion
         )
         ;;
     *)
@@ -50,12 +65,23 @@ case "${dispatcher_backend}" in
         ;;
 esac
 
+graph_args=()
+if [[ "${full_iter_cuda_graph}" == "1" ]]; then
+    graph_args+=(--moe-perf-full-iter-cuda-graph)
+fi
+
 if [[ "${run_unit_tests}" == "1" ]]; then
     CUDA_VISIBLE_DEVICES=0 pytest -q -s \
         tests/unit_tests/fusions/test_cutedsl_situ_glu.py \
         tests/unit_tests/transformer/moe/test_grouped_mlp.py::test_situ_glu_activation_flag_aliases \
         tests/unit_tests/transformer/moe/test_latent_moe_layer.py::TestLatentMoELayer::test_latent_up_projection_rmsnorm
+    CUDA_VISIBLE_DEVICES=0 pytest -q -s \
+        tests/unit_tests/transformer/moe/test_routers.py -k quantile
+    CUDA_VISIBLE_DEVICES=0 pytest -q -s \
+        tests/unit_tests/distributed/test_finalize_model_grads.py::TestFinalizeModelGradsMoEExpertBias::test_finalize_model_grads_updates_quantile_bias_bounds_and_resets_histogram
 fi
+
+echo "[kimi_k3] num_gpus=${num_gpus} ep=${expert_parallel_size} experts=${num_experts} topk=${router_topk} bias_update_method=${bias_update_method} qb_num_bins=${qb_num_bins} full_iter_cuda_graph=${full_iter_cuda_graph}"
 
 torchrun --standalone --nproc-per-node="${num_gpus}" \
     tests/functional_tests/test_cases/common/moe_perf/recipe_frontend.py \
@@ -71,13 +97,17 @@ torchrun --standalone --nproc-per-node="${num_gpus}" \
     --micro-batch-size 1 \
     --global-batch-size "${num_gpus}" \
     --num-experts "${num_experts}" \
-    --moe-router-topk 1 \
+    --moe-router-topk "${router_topk}" \
     --moe-router-pre-softmax \
     --moe-router-score-function sigmoid \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type none \
     --moe-router-enable-expert-bias \
+    --moe-router-bias-update-method "${bias_update_method}" \
+    --moe-router-qb-num-bins "${qb_num_bins}" \
+    --moe-router-fusion \
     "${dispatcher_args[@]}" \
+    "${graph_args[@]}" \
     --moe-grouped-gemm \
     --moe-mlp-glu-interleave-size 32 \
     --moe-ffn-hidden-size 256 \

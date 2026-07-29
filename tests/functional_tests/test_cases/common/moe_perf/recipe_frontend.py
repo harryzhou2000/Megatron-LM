@@ -24,7 +24,12 @@ from typing import Iterable, Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.distributed.finalize_model_grads import (
+    _update_router_expert_bias,
+    reset_model_temporary_tensors,
+)
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import fused_topk_with_score_function_supports_qb
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -141,7 +146,9 @@ def _warn_ignored_args(args) -> None:
         "sft": "SFT/THD data path is not constructed",
         "cuda_graph_scope": "full-model CUDA graph capture is not constructed",
         "cuda_graph_modules": "MoE partial CUDA graph capture is not constructed",
-        "use_cpu_initialization": "GPU initialization is used to avoid CPU RNG mutation inside GPU RNG contexts",
+        "use_cpu_initialization": (
+            "GPU initialization is used to avoid CPU RNG mutation inside GPU RNG contexts"
+        ),
     }
     for attr, reason in checks.items():
         value = getattr(args, attr, None)
@@ -201,7 +208,9 @@ def _resolve_hybrid_stack_spec(args, config):
     if not isinstance(stack_spec, ModuleSpec) and callable(stack_spec):
         stack_spec = stack_spec(config)
     if not isinstance(stack_spec, ModuleSpec):
-        raise TypeError(f"Hybrid --spec must resolve to ModuleSpec, got {type(stack_spec).__name__}")
+        raise TypeError(
+            f"Hybrid --spec must resolve to ModuleSpec, got {type(stack_spec).__name__}"
+        )
     return stack_spec
 
 
@@ -239,7 +248,10 @@ def _gpt_moe_layer_specs(args, config) -> list[MoELayerSpec]:
         if callable(spec) and not isinstance(spec, ModuleSpec):
             spec = spec(config)
         if isinstance(spec, ModuleSpec) and _is_moe_layer_spec(spec):
-            return [MoELayerSpec(layer_number, spec, "gpt") for layer_number in range(1, config.num_layers + 1)]
+            return [
+                MoELayerSpec(layer_number, spec, "gpt")
+                for layer_number in range(1, config.num_layers + 1)
+            ]
         raise ValueError(
             "GPT --spec did not resolve to a single MoE TransformerLayer spec. "
             "Use the standard GPT MoE spec path or provide a MoE layer ModuleSpec."
@@ -270,7 +282,9 @@ def _select_moe_layer_specs(args, config) -> list[MoELayerSpec]:
         or getattr(args, "hybrid_layer_pattern", None)
         or getattr(args, "hybrid_override_pattern", None)
     )
-    layer_specs = _hybrid_moe_layer_specs(args, config) if is_hybrid else _gpt_moe_layer_specs(args, config)
+    layer_specs = (
+        _hybrid_moe_layer_specs(args, config) if is_hybrid else _gpt_moe_layer_specs(args, config)
+    )
     if not layer_specs:
         raise ValueError("No MoE layers were found in the resolved full-model configuration.")
 
@@ -326,6 +340,111 @@ def _zero_layer_grads(module: torch.nn.Module) -> None:
             param.main_grad.zero_()
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = False
+
+
+def _router_bias_modules(layers: torch.nn.ModuleList) -> list[torch.nn.Module]:
+    return [
+        module
+        for module in layers.modules()
+        if getattr(module, "expert_bias", None) is not None and module.training
+    ]
+
+
+def _verify_router_bias_metadata(config, layers: torch.nn.ModuleList) -> dict[int, tuple[int, ...]]:
+    routers = _router_bias_modules(layers)
+    if not config.moe_router_enable_expert_bias:
+        if routers:
+            raise RuntimeError("Expert-bias router buffers exist while the feature is disabled.")
+        return {}
+    if not routers:
+        raise RuntimeError("No expert-bias router buffers were found in the MoE perf layers.")
+
+    pointers = {}
+    for router in routers:
+        pointers[id(router)] = (
+            router.expert_bias.data_ptr(),
+            *(
+                (router.qb_histogram.data_ptr(), router.qb_bin_bounds.data_ptr())
+                if config.moe_router_bias_update_method == "quantile"
+                else ()
+            ),
+        )
+        if config.moe_router_bias_update_method == "quantile":
+            if not fused_topk_with_score_function_supports_qb:
+                raise RuntimeError(
+                    "Quantile Balancing requested, but the installed Transformer Engine "
+                    "router does not expose the QB API."
+                )
+            if router.qb_histogram_mode != "fused_atomic":
+                raise RuntimeError(
+                    f"Expected fused_atomic QB histogram mode, got {router.qb_histogram_mode!r}."
+                )
+            if "qb_bin_bounds" not in router.state_dict():
+                raise RuntimeError("qb_bin_bounds must be persistent router state.")
+            if "qb_histogram" in router.state_dict():
+                raise RuntimeError("qb_histogram must remain nonpersistent step-local state.")
+
+    print_rank_0(
+        "[moe_perf] router_bias_metadata "
+        f"method={config.moe_router_bias_update_method} "
+        f"router_count={len(routers)} "
+        f"te_qb_api={fused_topk_with_score_function_supports_qb} "
+        f"qb_histogram_mode={'fused_atomic' if config.moe_router_bias_update_method == 'quantile' else 'none'} "
+        f"qb_num_bins={config.moe_router_qb_num_bins}"
+    )
+    return pointers
+
+
+def _verify_router_bias_pointers(
+    layers: torch.nn.ModuleList, expected_pointers: dict[int, tuple[int, ...]]
+) -> None:
+    for router in _router_bias_modules(layers):
+        actual = (
+            router.expert_bias.data_ptr(),
+            *(
+                (router.qb_histogram.data_ptr(), router.qb_bin_bounds.data_ptr())
+                if router.qb_histogram is not None
+                else ()
+            ),
+        )
+        if actual != expected_pointers[id(router)]:
+            raise RuntimeError(
+                f"Router bias/QB CUDA storage changed: expected={expected_pointers[id(router)]}, "
+                f"actual={actual}."
+            )
+
+
+def _verify_qb_histograms(
+    config, layers: torch.nn.ModuleList, expected_tokens_per_router: int
+) -> None:
+    if config.moe_router_bias_update_method != "quantile":
+        return
+    expected_count = expected_tokens_per_router * config.num_moe_experts
+    for router in _router_bias_modules(layers):
+        actual_count = int(router.qb_histogram.sum().item())
+        if actual_count != expected_count:
+            raise RuntimeError(
+                f"QB histogram count mismatch: expected={expected_count}, actual={actual_count}."
+            )
+
+
+def _time_router_bias_finalization(config, layers: torch.nn.ModuleList) -> float:
+    if not config.moe_router_enable_expert_bias:
+        return 0.0
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    _update_router_expert_bias(
+        [layers],
+        config,
+        tp_dp_cp_group=parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        ),
+    )
+    reset_model_temporary_tensors(config, [layers])
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end)
 
 
 def _verify_situ_glu_fused_backend(layers: torch.nn.ModuleList) -> None:
@@ -420,10 +539,7 @@ def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> floa
             forward_backward_expansion_factor
             * len(layer_specs)
             * moe_layer_flops(
-                total_tokens,
-                args.hidden_size,
-                moe_ffn_hidden_size,
-                shared_expert_size,
+                total_tokens, args.hidden_size, moe_ffn_hidden_size, shared_expert_size
             )
         )
 
@@ -489,6 +605,7 @@ def _build_full_iteration_wrapper(
 
     def forward_backward_func(**kwargs):
         del kwargs
+        reset_model_temporary_tensors(config, [layers])
         _zero_layer_grads(layers)
         _zero_static_input_grad(static_hidden)
         hidden_states = _forward_moe_layers(static_hidden, config, layers, layer_specs)
@@ -530,7 +647,9 @@ def _call_full_iteration_wrapper(*, args, config, wrapper, layers, paged_stash_e
     return start.elapsed_time(end), 0.0
 
 
-def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[MoELayerSpec]) -> None:
+def _run_moe_perf(
+    args, config, layers: torch.nn.ModuleList, layer_specs: list[MoELayerSpec]
+) -> None:
     if args.moe_perf_warmup_iters < 0 or args.moe_perf_iters <= 0:
         raise ValueError("--moe-perf-warmup-iters must be >= 0 and --moe-perf-iters must be > 0.")
 
@@ -558,10 +677,12 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
 
     forward_timings = []
     backward_timings = []
+    router_bias_finalize_timings = []
     max_allocated = []
     flops_per_iteration = _moe_only_flops_per_iteration(args, layer_specs)
     total_iters = args.moe_perf_warmup_iters + args.moe_perf_iters
     paged_stash_enabled = args.moe_perf_paged_stash
+    router_bias_pointers = _verify_router_bias_metadata(config, layers)
     graph_wrapper = None
     if args.moe_perf_full_iter_cuda_graph:
         graph_wrapper, _ = _build_full_iteration_wrapper(
@@ -582,6 +703,7 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
             torch.distributed.barrier()
 
         _zero_layer_grads(layers)
+        reset_model_temporary_tensors(config, [layers])
         torch.cuda.reset_peak_memory_stats()
 
         if graph_wrapper is not None:
@@ -602,6 +724,12 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
                 backward_grad=backward_grad_template,
                 paged_stash_enabled=paged_stash_enabled,
             )
+        if iteration == 0:
+            _verify_qb_histograms(
+                config, layers, expected_tokens_per_router=args.seq_length * args.micro_batch_size
+            )
+        router_bias_finalize_ms = _time_router_bias_finalization(config, layers)
+        _verify_router_bias_pointers(layers, router_bias_pointers)
         if iteration == 0 and config.use_situ_glu:
             _verify_situ_glu_fused_backend(layers)
         paged_stash_overflow, paged_stash_host_spill = _check_paged_stash_status(
@@ -613,6 +741,7 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
         if iteration >= args.moe_perf_warmup_iters:
             forward_timings.append(forward_ms)
             backward_timings.append(backward_ms)
+            router_bias_finalize_timings.append(router_bias_finalize_ms)
             max_allocated.append(torch.cuda.max_memory_allocated())
 
         if args.rank == 0:
@@ -630,6 +759,8 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
             print(
                 f"[moe_perf] iter={iteration} measured={iteration >= args.moe_perf_warmup_iters} "
                 f"forward_ms={forward_ms:.3f} backward_ms={backward_ms:.3f} "
+                f"router_bias_finalize_ms={router_bias_finalize_ms:.3f} "
+                f"router_bias_update_method={config.moe_router_bias_update_method} "
                 f"throughput_tflops_per_gpu={throughput:.1f} "
                 f"full_iter_cuda_graph={graph_wrapper is not None} "
                 f"paged_stash={paged_stash_enabled} "
@@ -642,7 +773,9 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
     if args.rank == 0:
         forward_ms = statistics.mean(forward_timings)
         backward_ms = statistics.mean(backward_timings)
+        router_bias_finalize_ms = statistics.mean(router_bias_finalize_timings)
         iteration_ms = forward_ms + backward_ms
+        end_to_end_ms = iteration_ms + router_bias_finalize_ms
         throughput = flops_per_iteration / ((iteration_ms / 1000.0) * 10**12 * args.world_size)
         print(
             "[moe_perf] summary "
@@ -652,6 +785,10 @@ def _run_moe_perf(args, config, layers: torch.nn.ModuleList, layer_specs: list[M
             f"forward_ms_stdev={statistics.pstdev(forward_timings) if len(forward_timings) > 1 else 0.0:.3f} "
             f"backward_ms_mean={backward_ms:.3f} "
             f"backward_ms_stdev={statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0:.3f} "
+            f"router_bias_finalize_ms_mean={router_bias_finalize_ms:.3f} "
+            f"router_bias_finalize_ms_stdev={statistics.pstdev(router_bias_finalize_timings) if len(router_bias_finalize_timings) > 1 else 0.0:.3f} "
+            f"router_bias_update_method={config.moe_router_bias_update_method} "
+            f"end_to_end_ms_mean={end_to_end_ms:.3f} "
             f"throughput_tflops_per_gpu={throughput:.1f} "
             f"flops_per_iteration={flops_per_iteration:.6e} "
             f"max_allocated_gib_mean={statistics.mean(max_allocated) / (1024 ** 3):.3f}",
@@ -694,6 +831,8 @@ def main() -> None:
             f"count={len(layer_specs)} "
             f"layer_numbers={[spec.layer_number for spec in layer_specs]} "
             f"force_load_balancing={config.moe_router_force_load_balancing} "
+            f"router_bias_update_method={config.moe_router_bias_update_method} "
+            f"qb_num_bins={config.moe_router_qb_num_bins} "
             f"latent_up_rmsnorm={config.moe_latent_up_projection_rmsnorm} "
             f"situ_glu={config.use_situ_glu} "
             f"situ_glu_impl={config.situ_glu_impl}"
