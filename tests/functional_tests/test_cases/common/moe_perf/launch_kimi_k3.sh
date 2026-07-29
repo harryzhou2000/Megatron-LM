@@ -15,6 +15,8 @@ dispatcher_backend="${DISPATCHER_BACKEND:-hybridep}"
 bias_update_method="${BIAS_UPDATE_METHOD:-quantile}"
 qb_num_bins="${QB_NUM_BINS:-1000}"
 full_iter_cuda_graph="${FULL_ITER_CUDA_GRAPH:-0}"
+paged_stash="${PAGED_STASH:-0}"
+expert_rank_capacity_factor="${EXPERT_RANK_CAPACITY_FACTOR:-}"
 log_dir="${KIMI_K3_LOG_DIR:-${repo_root}/logs/moe_perf}"
 log_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log_file="${KIMI_K3_LOG_FILE:-${log_dir}/kimi_k3_${dispatcher_backend}_ep${expert_parallel_size}_${bias_update_method}_${log_timestamp}.log}"
@@ -69,6 +71,15 @@ graph_args=()
 if [[ "${full_iter_cuda_graph}" == "1" ]]; then
     graph_args+=(--moe-perf-full-iter-cuda-graph)
 fi
+if [[ "${paged_stash}" == "1" ]]; then
+    graph_args+=(--moe-perf-paged-stash)
+fi
+if [[ -n "${expert_rank_capacity_factor}" ]]; then
+    graph_args+=(
+        --moe-perf-expert-rank-capacity-factor
+        "${expert_rank_capacity_factor}"
+    )
+fi
 
 if [[ "${run_unit_tests}" == "1" ]]; then
     CUDA_VISIBLE_DEVICES=0 pytest -q -s \
@@ -81,7 +92,7 @@ if [[ "${run_unit_tests}" == "1" ]]; then
         tests/unit_tests/distributed/test_finalize_model_grads.py::TestFinalizeModelGradsMoEExpertBias::test_finalize_model_grads_updates_quantile_bias_bounds_and_resets_histogram
 fi
 
-echo "[kimi_k3] num_gpus=${num_gpus} ep=${expert_parallel_size} experts=${num_experts} topk=${router_topk} bias_update_method=${bias_update_method} qb_num_bins=${qb_num_bins} full_iter_cuda_graph=${full_iter_cuda_graph}"
+echo "[kimi_k3] num_gpus=${num_gpus} ep=${expert_parallel_size} experts=${num_experts} topk=${router_topk} bias_update_method=${bias_update_method} qb_num_bins=${qb_num_bins} full_iter_cuda_graph=${full_iter_cuda_graph} paged_stash=${paged_stash} expert_rank_capacity_factor=${expert_rank_capacity_factor:-none}"
 
 torchrun --standalone --nproc-per-node="${num_gpus}" \
     tests/functional_tests/test_cases/common/moe_perf/recipe_frontend.py \

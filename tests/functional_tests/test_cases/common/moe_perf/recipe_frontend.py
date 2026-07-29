@@ -804,7 +804,10 @@ def main() -> None:
     _disable_unsupported_full_model_features(args)
     _force_balanced_routing(args)
     if args.moe_perf_expert_rank_capacity_factor is not None:
-        args.moe_expert_rank_capacity_factor = args.moe_perf_expert_rank_capacity_factor
+        # Keep the frontend-only static HybridEP buffer budget out of ordinary
+        # TransformerConfig validation. The perf harness applies it to the completed
+        # config below and reports any actual overflow; this allows QB to test a
+        # graph-safe no-overflow path without enabling production token dropping.
         args.use_transformer_engine_op_fuser = True
     set_global_variables(args, build_tokenizer=False)
     initialize_megatron()
