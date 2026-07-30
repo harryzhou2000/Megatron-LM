@@ -49,6 +49,7 @@ from megatron.core.transformer.moe.paged_stash import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import set_global_variables
@@ -601,6 +602,77 @@ def _call_full_iteration_wrapper(*, args, config, wrapper, layers, paged_stash_e
     return start.elapsed_time(end), 0.0
 
 
+def _uses_nsys_profile(args) -> bool:
+    """Return whether standard Megatron arguments request an NSys capture."""
+    return bool(args.profile and not args.use_pytorch_profiler)
+
+
+def _moe_perf_iteration_plan(args) -> tuple[int, int]:
+    """Return total iterations and the first iteration included in frontend metrics."""
+    if not _uses_nsys_profile(args):
+        return args.moe_perf_warmup_iters + args.moe_perf_iters, args.moe_perf_warmup_iters
+
+    profile_start = args.profile_step_start
+    profile_end = args.profile_step_end
+    if profile_start < 0 or profile_end <= profile_start:
+        raise ValueError(
+            "NSys profiling requires 0 <= --profile-step-start < --profile-step-end, "
+            f"got {profile_start} and {profile_end}."
+        )
+
+    # Match the normal training loop: start before iteration profile_start, stop
+    # after completed iteration profile_end, and schedule no later distributed work.
+    return profile_end, profile_start
+
+
+class _NSysProfiler:
+    """Mirror Megatron's CUDA-profiler API window for the standalone frontend."""
+
+    def __init__(self, args):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else args.rank
+        self.enabled = _uses_nsys_profile(args) and (
+            len(args.profile_ranks) == 0 or rank in args.profile_ranks
+        )
+        self.profile_start = args.profile_step_start
+        self.profile_end = args.profile_step_end
+        self.nvtx_ranges = args.nvtx_ranges
+        self.record_shapes = args.record_shapes
+        self._active = False
+        self._nvtx_context = None
+
+    def start_if_needed(self, iteration: int) -> None:
+        """Start NSys immediately before the configured frontend iteration."""
+        if not self.enabled or self._active or iteration != self.profile_start:
+            return
+        if self.nvtx_ranges:
+            configure_nvtx_profiling(True)
+        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+        self._active = True
+        try:
+            self._nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=self.record_shapes)
+            self._nvtx_context.__enter__()
+        except Exception:
+            self.close()
+            raise
+
+    def stop_if_needed(self, completed_iteration: int) -> None:
+        """Stop NSys after the configured number of iterations has completed."""
+        if self._active and completed_iteration == self.profile_end:
+            self.close()
+
+    def close(self) -> None:
+        """Close an active profile window, including on an exceptional exit."""
+        if not self._active:
+            return
+        if self.nvtx_ranges:
+            configure_nvtx_profiling(False)
+        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+        if self._nvtx_context is not None:
+            self._nvtx_context.__exit__(None, None, None)
+        self._nvtx_context = None
+        self._active = False
+
+
 def _run_moe_perf(
     args, config, layers: torch.nn.ModuleList, layer_specs: list[MoELayerSpec]
 ) -> None:
@@ -634,9 +706,10 @@ def _run_moe_perf(
     router_bias_finalize_timings = []
     max_allocated = []
     flops_per_iteration = _moe_only_flops_per_iteration(args, layer_specs)
-    total_iters = args.moe_perf_warmup_iters + args.moe_perf_iters
+    total_iters, measurement_start = _moe_perf_iteration_plan(args)
     paged_stash_enabled = args.moe_perf_paged_stash
     router_bias_pointers = _verify_router_bias_metadata(config, layers)
+    nsys_profiler = _NSysProfiler(args)
     graph_wrapper = None
     if args.moe_perf_full_iter_cuda_graph:
         graph_wrapper, _ = _build_full_iteration_wrapper(
@@ -649,80 +722,86 @@ def _run_moe_perf(
             paged_stash_enabled=paged_stash_enabled,
         )
 
-    for iteration in range(total_iters):
-        random_ste_generator = getattr(RandomSTE, "generator", None)
-        if random_ste_generator is not None:
-            random_ste_generator.manual_seed(random_ste_generator.initial_seed())
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+    try:
+        for iteration in range(total_iters):
+            nsys_profiler.start_if_needed(iteration)
+            random_ste_generator = getattr(RandomSTE, "generator", None)
+            if random_ste_generator is not None:
+                random_ste_generator.manual_seed(random_ste_generator.initial_seed())
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
-        _zero_layer_grads(layers)
-        reset_model_temporary_tensors(config, [layers])
-        torch.cuda.reset_peak_memory_stats()
+            _zero_layer_grads(layers)
+            reset_model_temporary_tensors(config, [layers])
+            torch.cuda.reset_peak_memory_stats()
 
-        if graph_wrapper is not None:
-            forward_ms, backward_ms = _call_full_iteration_wrapper(
-                args=args,
-                config=config,
-                wrapper=graph_wrapper,
-                layers=layers,
-                paged_stash_enabled=paged_stash_enabled,
+            if graph_wrapper is not None:
+                forward_ms, backward_ms = _call_full_iteration_wrapper(
+                    args=args,
+                    config=config,
+                    wrapper=graph_wrapper,
+                    layers=layers,
+                    paged_stash_enabled=paged_stash_enabled,
+                )
+            else:
+                forward_ms, backward_ms = _run_eager_iteration(
+                    args=args,
+                    config=config,
+                    layers=layers,
+                    layer_specs=layer_specs,
+                    hidden_template=hidden_template,
+                    backward_grad=backward_grad_template,
+                    paged_stash_enabled=paged_stash_enabled,
+                )
+            if iteration == 0:
+                _verify_qb_histograms(
+                    config,
+                    layers,
+                    expected_tokens_per_router=args.seq_length * args.micro_batch_size,
+                )
+            router_bias_finalize_ms = _time_router_bias_finalization(config, layers)
+            _verify_router_bias_pointers(layers, router_bias_pointers)
+            if iteration == 0 and config.use_situ_glu:
+                _verify_situ_glu_fused_backend(layers)
+            paged_stash_overflow, paged_stash_host_spill = _check_paged_stash_status(
+                paged_stash_enabled
             )
-        else:
-            forward_ms, backward_ms = _run_eager_iteration(
-                args=args,
-                config=config,
-                layers=layers,
-                layer_specs=layer_specs,
-                hidden_template=hidden_template,
-                backward_grad=backward_grad_template,
-                paged_stash_enabled=paged_stash_enabled,
-            )
-        if iteration == 0:
-            _verify_qb_histograms(
-                config, layers, expected_tokens_per_router=args.seq_length * args.micro_batch_size
-            )
-        router_bias_finalize_ms = _time_router_bias_finalization(config, layers)
-        _verify_router_bias_pointers(layers, router_bias_pointers)
-        if iteration == 0 and config.use_situ_glu:
-            _verify_situ_glu_fused_backend(layers)
-        paged_stash_overflow, paged_stash_host_spill = _check_paged_stash_status(
-            paged_stash_enabled
-        )
-        iteration_ms = forward_ms + backward_ms
-        throughput = flops_per_iteration / ((iteration_ms / 1000.0) * 10**12 * args.world_size)
+            iteration_ms = forward_ms + backward_ms
+            throughput = flops_per_iteration / ((iteration_ms / 1000.0) * 10**12 * args.world_size)
+            nsys_profiler.stop_if_needed(iteration + 1)
 
-        if iteration >= args.moe_perf_warmup_iters:
-            forward_timings.append(forward_ms)
-            backward_timings.append(backward_ms)
-            router_bias_finalize_timings.append(router_bias_finalize_ms)
-            max_allocated.append(torch.cuda.max_memory_allocated())
+            if iteration >= measurement_start:
+                forward_timings.append(forward_ms)
+                backward_timings.append(backward_ms)
+                router_bias_finalize_timings.append(router_bias_finalize_ms)
+                max_allocated.append(torch.cuda.max_memory_allocated())
 
-        if args.rank == 0:
-            current_iter = iteration + 1
-            total_iters = args.moe_perf_warmup_iters + args.moe_perf_iters
-            consumed_samples = current_iter * args.micro_batch_size * args.data_parallel_size
-            print(
-                f" iteration {current_iter:8d}/{total_iters:8d} | "
-                f"consumed samples: {consumed_samples:12d} | "
-                f"elapsed time per iteration (ms): {iteration_ms:.1f} | "
-                f"throughput per GPU (TFLOP/s/GPU): {throughput:.1f} | "
-                f"global batch size: {args.micro_batch_size * args.data_parallel_size:5d} |",
-                flush=True,
-            )
-            print(
-                f"[moe_perf] iter={iteration} measured={iteration >= args.moe_perf_warmup_iters} "
-                f"forward_ms={forward_ms:.3f} backward_ms={backward_ms:.3f} "
-                f"router_bias_finalize_ms={router_bias_finalize_ms:.3f} "
-                f"router_bias_update_method={config.moe_router_bias_update_method} "
-                f"throughput_tflops_per_gpu={throughput:.1f} "
-                f"full_iter_cuda_graph={graph_wrapper is not None} "
-                f"paged_stash={paged_stash_enabled} "
-                f"paged_stash_overflow={paged_stash_overflow} "
-                f"paged_stash_host_spill={paged_stash_host_spill} "
-                f"max_allocated={torch.cuda.max_memory_allocated() / (1024 ** 3):.3f} GiB",
-                flush=True,
-            )
+            if args.rank == 0:
+                current_iter = iteration + 1
+                consumed_samples = current_iter * args.micro_batch_size * args.data_parallel_size
+                print(
+                    f" iteration {current_iter:8d}/{total_iters:8d} | "
+                    f"consumed samples: {consumed_samples:12d} | "
+                    f"elapsed time per iteration (ms): {iteration_ms:.1f} | "
+                    f"throughput per GPU (TFLOP/s/GPU): {throughput:.1f} | "
+                    f"global batch size: {args.micro_batch_size * args.data_parallel_size:5d} |",
+                    flush=True,
+                )
+                print(
+                    f"[moe_perf] iter={iteration} measured={iteration >= measurement_start} "
+                    f"forward_ms={forward_ms:.3f} backward_ms={backward_ms:.3f} "
+                    f"router_bias_finalize_ms={router_bias_finalize_ms:.3f} "
+                    f"router_bias_update_method={config.moe_router_bias_update_method} "
+                    f"throughput_tflops_per_gpu={throughput:.1f} "
+                    f"full_iter_cuda_graph={graph_wrapper is not None} "
+                    f"paged_stash={paged_stash_enabled} "
+                    f"paged_stash_overflow={paged_stash_overflow} "
+                    f"paged_stash_host_spill={paged_stash_host_spill} "
+                    f"max_allocated={torch.cuda.max_memory_allocated() / (1024 ** 3):.3f} GiB",
+                    flush=True,
+                )
+    finally:
+        nsys_profiler.close()
 
     if args.rank == 0:
         forward_ms = statistics.mean(forward_timings)
