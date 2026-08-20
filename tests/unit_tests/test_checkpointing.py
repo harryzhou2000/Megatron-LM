@@ -24,6 +24,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
     read_metadata,
     save_checkpoint,
@@ -72,6 +73,39 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize(
+    "checkpoint_args",
+    [
+        SimpleNamespace(swiglu=True, situ_glu=False, situ_glu_beta1=4.0, situ_glu_beta2=25.0),
+        SimpleNamespace(swiglu=False, situ_glu=True, situ_glu_beta1=3.0, situ_glu_beta2=20.0),
+    ],
+)
+def test_load_args_restores_glu_activation_from_checkpoint(checkpoint_args):
+    """Checkpoint arguments select the saved gated activation and SiTU scaling."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        swiglu=not checkpoint_args.swiglu,
+        situ_glu=not checkpoint_args.situ_glu,
+        situ_glu_beta1=1.0,
+        situ_glu_beta2=1.0,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.swiglu is checkpoint_args.swiglu
+    assert restored_args.situ_glu is checkpoint_args.situ_glu
+    assert restored_args.situ_glu_beta1 == checkpoint_args.situ_glu_beta1
+    assert restored_args.situ_glu_beta2 == checkpoint_args.situ_glu_beta2
 
 
 def create_checkpoint(load_path, ckpt_format):
