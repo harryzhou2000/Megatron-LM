@@ -34,6 +34,47 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
 
+## Empirical Mock Vision Records
+
+The Qwen3.5 mock dataset can replay public JSONL v1 workload records while
+continuing to generate synthetic text and pixels. Each non-empty line contains
+an LLM-side sequence length and exactly one vision representation:
+
+```json
+{"format_version": 1, "llm_sequence_length": 4096,
+ "vision_tokens_per_image": [638, 638, 540]}
+{"format_version": 1, "llm_sequence_length": 2048,
+ "image_sizes": [[224, 448], [512, 512]]}
+```
+
+`llm_sequence_length` is the real `input_ids` length before batching. It
+includes text, one vision-start token per image, and image-placeholder tokens,
+but excludes THD alignment padding. `vision_tokens_per_image` stores
+post-merge LLM token counts and reconstructs synthetic closest-to-square image
+grids. `image_sizes` stores pixel `[height, width]` pairs and preserves
+rectangular geometry; Qwen image dimensions must be divisible by 32 with the
+current patch and merge sizes. Empty arrays represent text-only samples.
+
+Use a JSONL file or a flat directory of JSONL shards:
+
+```bash
+--dataset-provider mock \
+--mock-vision-distribution empirical_record \
+--mock-vision-records-path /path/to/records \
+--mock-vision-record-sampling cycle \
+--use-vanilla-collate-fn \
+--use-packed-sequence \
+--image-seq-length inf
+```
+
+Packed mode concatenates variable-length samples into THD and constructs real
+and alignment-padded cumulative sequence lengths. Without
+`--use-packed-sequence`, samples are padded to the longest sequence in the
+batch. Empirical records are not compatible with full-iteration CUDA graphs
+until a static token/grid/pixel bucketing contract is provided. The format is
+image-only; video temporal metadata is intentionally not overloaded into
+`image_sizes`.
+
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
 Convert a HuggingFace release to a Megatron-FSDP DTensor checkpoint via

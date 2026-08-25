@@ -37,7 +37,13 @@ def _init_model_parallel():
 
 
 def _make_sample(
-    seq_len: int, *, base: int = 0, num_patches: int = 4, pixel_dim: int = 8, device: str = "cuda"
+    seq_len: int,
+    *,
+    base: int = 0,
+    num_patches: int = 4,
+    pixel_dim: int = 8,
+    has_real_vision: bool = True,
+    device: str = "cuda",
 ):
     """Per-sample dict in the shape produced by ``CordV2VLMDataset.__getitem__``.
 
@@ -45,13 +51,15 @@ def _make_sample(
     ``pixel_values`` is ``[num_patches, pixel_dim]``; ``image_grid_thw`` is
     ``[1, 3]``.
     """
-    return {
+    sample = {
         "input_ids": torch.arange(seq_len, dtype=torch.long, device=device) + base,
         "labels": (torch.arange(seq_len, dtype=torch.long, device=device) + base + 100),
         "loss_mask": torch.ones(seq_len, dtype=torch.float, device=device),
         "pixel_values": torch.full((num_patches, pixel_dim), float(base), device=device),
         "image_grid_thw": torch.tensor([[2, 4, 4]], dtype=torch.long, device=device),
     }
+    sample["has_real_vision"] = torch.tensor(has_real_vision, device=device)
+    return sample
 
 
 # ===================================================================
@@ -169,6 +177,29 @@ class TestPackOrPadBatchPacked:
         packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
         assert packed["image_grid_thw"].shape == (2, 3)
 
+    def test_mixed_batch_drops_text_only_dummy_vision(self):
+        text_only = _make_sample(5, base=0, num_patches=4, has_real_vision=False)
+        image = _make_sample(7, base=10, num_patches=6)
+
+        packed = pack_or_pad_batch([text_only, image], use_packed_sequence=True, device="cuda")
+
+        assert packed["pixel_values"].shape == (6, 8)
+        assert packed["pixel_values"].eq(10.0).all().item()
+        assert packed["image_grid_thw"].shape == (1, 3)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 5, 12]
+
+    def test_all_text_batch_keeps_one_dummy_vision_row(self):
+        samples = [
+            _make_sample(5, base=0, has_real_vision=False),
+            _make_sample(7, base=10, has_real_vision=False),
+        ]
+
+        packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
+
+        assert packed["pixel_values"].shape == (4, 8)
+        assert packed["pixel_values"].eq(0.0).all().item()
+        assert packed["image_grid_thw"].shape == (1, 3)
+
     def test_single_sample_round_trip(self):
         """A single sample packs to its own length."""
         s = _make_sample(7, base=0)
@@ -234,6 +265,22 @@ class TestPackOrPadBatchPadded:
         assert padded["pixel_values"].shape == (10, 8)
         assert padded["pixel_values"][:4].eq(0.0).all().item()
         assert padded["pixel_values"][4:].eq(10.0).all().item()
+
+    def test_mixed_batch_drops_text_only_dummy_vision(self):
+        text_only = _make_sample(3, base=0, num_patches=4, has_real_vision=False)
+        image = _make_sample(5, base=10, num_patches=6)
+
+        padded = pack_or_pad_batch(
+            [text_only, image], use_packed_sequence=False, seq_length=8, device="cuda"
+        )
+
+        assert padded["input_ids"].shape == (2, 5)
+        assert padded["pixel_values"].shape == (6, 8)
+        assert padded["image_grid_thw"].shape == (1, 3)
+        assert padded["padding_mask"].tolist() == [
+            [False, False, False, True, True],
+            [False, False, False, False, False],
+        ]
 
 
 # ===================================================================
