@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Opt-in eight-GPU end-to-end test for empirical multimodal mock records.
+"""Opt-in eight-GPU Qwen MoE/GDN end-to-end test for empirical mock records.
 
 Run this file with a single pytest controller process. The test itself launches
 the eight distributed training workers::
@@ -26,7 +26,7 @@ _RUN_E2E = os.getenv("RUN_MULTIMODAL_PRETRAIN_E2E") == "1"
 @pytest.mark.skipif(not _RUN_E2E, reason="set RUN_MULTIMODAL_PRETRAIN_E2E=1")
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires eight visible GPUs")
 def test_empirical_records_complete_packed_pretrain(tmp_path):
-    """Exercise CLI setup, dataset, THD forward/backward, and optimizer update."""
+    """Exercise packed records with full-size Qwen MoE/GDN layers and EP8."""
 
     repo_root = Path(__file__).resolve().parents[3]
     records_path = tmp_path / "records.jsonl"
@@ -47,7 +47,7 @@ def test_empirical_records_complete_packed_pretrain(tmp_path):
         "--model-arch",
         "qwen35_vl",
         "--model-variant",
-        "0.8b",
+        "35b_a3b",
         "--dataset-provider",
         "mock",
         "--mock-vision-distribution",
@@ -75,18 +75,20 @@ def test_empirical_records_complete_packed_pretrain(tmp_path):
         "--max-position-embeddings",
         "256",
         "--num-layers",
-        "1",
-        "--hidden-size",
-        "256",
-        "--ffn-hidden-size",
-        "512",
-        "--num-attention-heads",
         "4",
+        "--hidden-size",
+        "2048",
+        "--ffn-hidden-size",
+        "4096",
+        "--num-attention-heads",
+        "16",
         "--group-query-attention",
         "--num-query-groups",
         "2",
+        # Keep the Qwen35 layer shape except for SDPA head width: 256-wide
+        # heads have no CI-portable THD backend when sequences are inter-padded.
         "--kv-channels",
-        "64",
+        "128",
         "--normalization",
         "RMSNorm",
         "--norm-epsilon",
@@ -95,24 +97,67 @@ def test_empirical_records_complete_packed_pretrain(tmp_path):
         "--disable-bias-linear",
         "--position-embedding-type",
         "rope",
+        "--no-rope-fusion",
         "--rotary-percent",
-        "1.0",
+        "0.25",
         "--rotary-base",
-        "1000000",
+        "10000000",
+        "--rotary-seq-len-interpolation-factor",
+        "1",
         "--qk-layernorm",
         "--attention-output-gate",
+        "--attention-dropout",
+        "0.0",
+        "--hidden-dropout",
+        "0.0",
+        "--apply-layernorm-1p",
+        "--untie-embeddings-and-output-weights",
+        "--experimental-attention-variant",
+        "gated_delta_net",
+        "--linear-attention-freq",
+        "4",
+        "--linear-conv-kernel-dim",
+        "4",
+        "--linear-key-head-dim",
+        "128",
+        "--linear-value-head-dim",
+        "128",
+        "--linear-num-key-heads",
+        "16",
+        "--linear-num-value-heads",
+        "32",
+        "--num-experts",
+        "256",
+        "--moe-ffn-hidden-size",
+        "512",
+        "--moe-shared-expert-intermediate-size",
+        "512",
+        "--moe-shared-expert-gate",
+        "--moe-router-load-balancing-type",
+        "aux_loss",
+        "--moe-router-topk",
+        "8",
+        "--moe-grouped-gemm",
+        "--moe-aux-loss-coeff",
+        "1e-3",
+        "--moe-token-dispatcher-type",
+        "alltoall",
+        "--moe-router-dtype",
+        "fp32",
         "--tensor-model-parallel-size",
         "1",
         "--pipeline-model-parallel-size",
         "1",
         "--context-parallel-size",
         "1",
-        "--micro-batch-size",
-        "1",
-        "--global-batch-size",
+        "--expert-model-parallel-size",
         "8",
+        "--micro-batch-size",
+        "4",
+        "--global-batch-size",
+        "32",
         "--train-iters",
-        "2",
+        "3",
         "--lr",
         "1e-4",
         "--min-lr",
@@ -134,9 +179,10 @@ def test_empirical_records_complete_packed_pretrain(tmp_path):
         "--vocab-size",
         "248320",
         "--make-vocab-size-divisible-by",
-        "128",
+        "485",
         "--distributed-backend",
         "nccl",
+        "--enable-experimental",
         "--log-interval",
         "1",
         "--eval-iters",
@@ -162,5 +208,5 @@ def test_empirical_records_complete_packed_pretrain(tmp_path):
 
     assert result.returncode == 0
     losses = [float(value) for value in re.findall(r"lm loss:\s*([+\-0-9.eE]+)", result.stdout)]
-    assert len(losses) >= 2
+    assert len(losses) >= 3
     assert all(math.isfinite(loss) for loss in losses)
