@@ -10,6 +10,12 @@ num_gpus="${NUM_GPUS:-8}"
 expert_parallel_size="${EXPERT_PARALLEL_SIZE:-8}"
 num_experts="${NUM_EXPERTS:-8}"
 router_topk="${ROUTER_TOPK:-1}"
+hidden_size="${HIDDEN_SIZE:-256}"
+num_attention_heads="${NUM_ATTENTION_HEADS:-4}"
+seq_length="${SEQ_LENGTH:-256}"
+moe_ffn_hidden_size="${MOE_FFN_HIDDEN_SIZE:-256}"
+shared_expert_intermediate_size="${SHARED_EXPERT_INTERMEDIATE_SIZE:-256}"
+moe_latent_size="${MOE_LATENT_SIZE:-128}"
 run_unit_tests="${RUN_UNIT_TESTS:-1}"
 dispatcher_backend="${DISPATCHER_BACKEND:-hybridep}"
 bias_update_method="${BIAS_UPDATE_METHOD:-quantile}"
@@ -67,6 +73,21 @@ case "${dispatcher_backend}" in
         ;;
 esac
 
+bias_args=(--moe-aux-loss-coeff 0)
+if [[ "${bias_update_method}" == "quantile" ]]; then
+    bias_args+=(
+        --moe-router-load-balancing-type quantile_balancing
+        --moe-router-quantile-balancing-estimation-scope global_batch
+        --moe-router-qb-num-bins "${qb_num_bins}"
+    )
+else
+    bias_args+=(
+        --moe-router-load-balancing-type none
+        --moe-router-enable-expert-bias
+        --moe-router-bias-update-rate "${ROUTER_BIAS_UPDATE_RATE:-0.001}"
+    )
+fi
+
 graph_args=()
 if [[ "${full_iter_cuda_graph}" == "1" ]]; then
     graph_args+=(--moe-perf-full-iter-cuda-graph)
@@ -82,48 +103,45 @@ if [[ -n "${expert_rank_capacity_factor}" ]]; then
 fi
 
 if [[ "${run_unit_tests}" == "1" ]]; then
-    CUDA_VISIBLE_DEVICES=0 pytest -q -s \
-        tests/unit_tests/fusions/test_cutedsl_situ_glu.py \
-        tests/unit_tests/transformer/moe/test_grouped_mlp.py::test_situ_glu_activation_flag_aliases \
-        tests/unit_tests/transformer/moe/test_latent_moe_layer.py::TestLatentMoELayer::test_latent_up_projection_rmsnorm
-    CUDA_VISIBLE_DEVICES=0 pytest -q -s \
-        tests/unit_tests/transformer/moe/test_routers.py -k quantile
-    CUDA_VISIBLE_DEVICES=0 pytest -q -s \
-        tests/unit_tests/distributed/test_finalize_model_grads.py::TestFinalizeModelGradsMoEExpertBias::test_finalize_model_grads_updates_quantile_bias_bounds_and_resets_histogram
+    CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s \
+        tests/unit_tests/transformer/test_situ_glu.py
+    CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s \
+        tests/unit_tests/transformer/moe/test_grouped_mlp.py -k situ_glu
+    CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s \
+        tests/unit_tests/transformer/moe/test_latent_moe_layer.py -k rmsnorm
+    CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s \
+        tests/unit_tests/transformer/moe/test_quantile_balancing.py
 fi
 
-echo "[kimi_k3] num_gpus=${num_gpus} ep=${expert_parallel_size} experts=${num_experts} topk=${router_topk} bias_update_method=${bias_update_method} qb_num_bins=${qb_num_bins} full_iter_cuda_graph=${full_iter_cuda_graph} paged_stash=${paged_stash} expert_rank_capacity_factor=${expert_rank_capacity_factor:-none}"
+echo "[kimi_k3] num_gpus=${num_gpus} ep=${expert_parallel_size} experts=${num_experts} topk=${router_topk} hidden=${hidden_size} moe_ffn=${moe_ffn_hidden_size} latent=${moe_latent_size} bias_update_method=${bias_update_method} qb_num_bins=${qb_num_bins} full_iter_cuda_graph=${full_iter_cuda_graph} paged_stash=${paged_stash} expert_rank_capacity_factor=${expert_rank_capacity_factor:-none}"
 
-torchrun --standalone --nproc-per-node="${num_gpus}" \
+python -m torch.distributed.run --standalone --nproc_per_node="${num_gpus}" \
     tests/functional_tests/test_cases/common/moe_perf/recipe_frontend.py \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --expert-tensor-parallel-size 1 \
     --expert-model-parallel-size "${expert_parallel_size}" \
     --num-layers 1 \
-    --hidden-size 256 \
-    --num-attention-heads 4 \
-    --seq-length 256 \
-    --max-position-embeddings 256 \
+    --hidden-size "${hidden_size}" \
+    --num-attention-heads "${num_attention_heads}" \
+    --seq-length "${seq_length}" \
+    --max-position-embeddings "${seq_length}" \
     --micro-batch-size 1 \
     --global-batch-size "${num_gpus}" \
     --num-experts "${num_experts}" \
     --moe-router-topk "${router_topk}" \
-    --moe-router-pre-softmax \
     --moe-router-score-function sigmoid \
     --moe-router-dtype fp32 \
-    --moe-router-load-balancing-type none \
-    --moe-router-enable-expert-bias \
-    --moe-router-bias-update-method "${bias_update_method}" \
-    --moe-router-qb-num-bins "${qb_num_bins}" \
+    "${bias_args[@]}" \
     --moe-router-fusion \
     "${dispatcher_args[@]}" \
     "${graph_args[@]}" \
     --moe-grouped-gemm \
     --moe-mlp-glu-interleave-size 32 \
-    --moe-ffn-hidden-size 256 \
-    --moe-shared-expert-intermediate-size 256 \
-    --moe-latent-size 128 \
+    --ffn-hidden-size "${moe_ffn_hidden_size}" \
+    --moe-ffn-hidden-size "${moe_ffn_hidden_size}" \
+    --moe-shared-expert-intermediate-size "${shared_expert_intermediate_size}" \
+    --moe-latent-size "${moe_latent_size}" \
     --moe-latent-up-projection-rmsnorm \
     --normalization RMSNorm \
     --situ-glu \
