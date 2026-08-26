@@ -32,6 +32,46 @@ def test_iteration_plan_without_nsys_uses_frontend_counts():
     assert recipe_frontend._moe_perf_iteration_plan(args) == (160, 10)
 
 
+@pytest.mark.parametrize(
+    ("load_balancing_type", "enable_expert_bias", "expected"),
+    [("quantile_balancing", False, "quantile"), ("none", True, "sign"), ("none", False, "none")],
+)
+def test_router_bias_update_method_matches_current_mcore_modes(
+    load_balancing_type, enable_expert_bias, expected
+):
+    config = SimpleNamespace(
+        moe_router_load_balancing_type=load_balancing_type,
+        moe_router_enable_expert_bias=enable_expert_bias,
+    )
+
+    assert recipe_frontend._router_bias_update_method(config) == expected
+
+
+def test_kimi_moe_flops_count_situ_glu_and_latent_projections():
+    args = SimpleNamespace(
+        micro_batch_size=1,
+        data_parallel_size=2,
+        seq_length=3,
+        hidden_size=8,
+        ffn_hidden_size=32,
+        moe_ffn_hidden_size=16,
+        moe_shared_expert_intermediate_size=12,
+        moe_router_topk=2,
+        moe_latent_size=4,
+        swiglu=False,
+        situ_glu=True,
+    )
+    total_tokens = 6
+    scale_factor = 3.0 / 2.0
+    routed_expert_flops = 4 * total_tokens * 4 * 16 * 2 * scale_factor
+    latent_projection_flops = 4 * total_tokens * 8 * 4
+    shared_expert_flops = 4 * total_tokens * 8 * 12 * scale_factor
+
+    assert recipe_frontend._moe_only_flops_per_iteration(args, [object()]) == 3 * (
+        routed_expert_flops + latent_projection_flops + shared_expert_flops
+    )
+
+
 def test_iteration_plan_with_nsys_matches_standard_profile_window():
     args = _make_args(profile=True)
 

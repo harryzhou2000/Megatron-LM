@@ -23,8 +23,10 @@ from typing import Iterable, Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activations import situlu
 from megatron.core.distributed.finalize_model_grads import (
     _update_router_expert_bias,
+    _update_router_expert_bias_with_quantile,
     reset_model_temporary_tensors,
 )
 from megatron.core.enums import Fp8Recipe
@@ -54,7 +56,6 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import set_global_variables
 from megatron.training.initialize import initialize_megatron
-from megatron.training.training import _moe_layer_flops
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -350,9 +351,18 @@ def _router_bias_modules(layers: torch.nn.ModuleList) -> list[torch.nn.Module]:
     ]
 
 
+def _router_bias_update_method(config) -> str:
+    if config.moe_router_load_balancing_type == "quantile_balancing":
+        return "quantile"
+    if config.moe_router_enable_expert_bias:
+        return "sign"
+    return "none"
+
+
 def _verify_router_bias_metadata(config, layers: torch.nn.ModuleList) -> dict[int, tuple[int, ...]]:
     routers = _router_bias_modules(layers)
-    if not config.moe_router_enable_expert_bias:
+    use_quantile_balancing = _router_bias_update_method(config) == "quantile"
+    if not config.moe_router_enable_expert_bias and not use_quantile_balancing:
         if routers:
             raise RuntimeError("Expert-bias router buffers exist while the feature is disabled.")
         return {}
@@ -365,19 +375,15 @@ def _verify_router_bias_metadata(config, layers: torch.nn.ModuleList) -> dict[in
             router.expert_bias.data_ptr(),
             *(
                 (router.qb_histogram.data_ptr(), router.qb_bin_bounds.data_ptr())
-                if config.moe_router_bias_update_method == "quantile"
+                if use_quantile_balancing
                 else ()
             ),
         )
-        if config.moe_router_bias_update_method == "quantile":
-            if not fused_topk_with_score_function_supports_qb:
+        if use_quantile_balancing:
+            if config.moe_router_fusion and not fused_topk_with_score_function_supports_qb:
                 raise RuntimeError(
                     "Quantile Balancing requested, but the installed Transformer Engine "
                     "router does not expose the QB API."
-                )
-            if router.qb_histogram_mode != "fused_atomic":
-                raise RuntimeError(
-                    f"Expected fused_atomic QB histogram mode, got {router.qb_histogram_mode!r}."
                 )
             if "qb_bin_bounds" not in router.state_dict():
                 raise RuntimeError("qb_bin_bounds must be persistent router state.")
@@ -385,12 +391,10 @@ def _verify_router_bias_metadata(config, layers: torch.nn.ModuleList) -> dict[in
                 raise RuntimeError("qb_histogram must remain nonpersistent step-local state.")
 
     print_rank_0(
-        "[moe_perf] router_bias_metadata "
-        f"method={config.moe_router_bias_update_method} "
-        f"router_count={len(routers)} "
-        f"te_qb_api={fused_topk_with_score_function_supports_qb} "
-        f"qb_histogram_mode={'fused_atomic' if config.moe_router_bias_update_method == 'quantile' else 'none'} "
-        f"qb_num_bins={config.moe_router_qb_num_bins}"
+        f"[moe_perf] router_bias_metadata method={_router_bias_update_method(config)}"
+        f" router_count={len(routers)} te_qb_api={fused_topk_with_score_function_supports_qb}"
+        f" qb_histogram_mode={'fused_atomic' if use_quantile_balancing and config.moe_router_fusion else 'none'}"
+        f" qb_num_bins={config.moe_router_qb_num_bins}"
     )
     return pointers
 
@@ -417,7 +421,7 @@ def _verify_router_bias_pointers(
 def _verify_qb_histograms(
     config, layers: torch.nn.ModuleList, expected_tokens_per_router: int
 ) -> None:
-    if config.moe_router_bias_update_method != "quantile":
+    if config.moe_router_load_balancing_type != "quantile_balancing":
         return
     expected_count = expected_tokens_per_router * config.num_moe_experts
     for router in _router_bias_modules(layers):
@@ -429,12 +433,18 @@ def _verify_qb_histograms(
 
 
 def _time_router_bias_finalization(config, layers: torch.nn.ModuleList) -> float:
-    if not config.moe_router_enable_expert_bias:
+    use_quantile_balancing = _router_bias_update_method(config) == "quantile"
+    if not config.moe_router_enable_expert_bias and not use_quantile_balancing:
         return 0.0
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    _update_router_expert_bias(
+    update_fn = (
+        _update_router_expert_bias_with_quantile
+        if use_quantile_balancing
+        else _update_router_expert_bias
+    )
+    update_fn(
         [layers],
         config,
         tp_dp_cp_group=parallel_state.get_tensor_and_data_parallel_group(
@@ -495,6 +505,32 @@ def _quantization_context(config, layer_number: int):
     return nullcontext()
 
 
+def _moe_layer_gemm_flops(
+    total_tokens: int,
+    hidden_size: int,
+    moe_ffn_hidden_size: int,
+    shared_expert_ffn_hidden_size: int,
+    num_experts_routed_to: int,
+    moe_latent_size: Optional[int] = None,
+    gated_linear_unit: bool = False,
+) -> float:
+    """Calculate the MoE GEMM FLOPs counted by the training throughput metric."""
+    scale_factor = 3.0 / 2.0 if gated_linear_unit else 1.0
+    expert_input_size = moe_latent_size or hidden_size
+    routed_flops = (
+        4
+        * total_tokens
+        * expert_input_size
+        * moe_ffn_hidden_size
+        * num_experts_routed_to
+        * scale_factor
+    )
+    if moe_latent_size is not None:
+        routed_flops += 4 * total_tokens * hidden_size * moe_latent_size
+    shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+    return routed_flops + shared_flops
+
+
 def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> float:
     """Compute MoE-only GEMM FLOPs for one frontend iteration."""
 
@@ -510,14 +546,14 @@ def _moe_only_flops_per_iteration(args, layer_specs: list[MoELayerSpec]) -> floa
     return (
         forward_backward_expansion_factor
         * len(layer_specs)
-        * _moe_layer_flops(
+        * _moe_layer_gemm_flops(
             total_tokens,
             args.hidden_size,
             moe_ffn_hidden_size,
             shared_expert_size,
             args.moe_router_topk,
             args.moe_latent_size,
-            gated_linear_unit=args.swiglu or args.use_situ_glu,
+            gated_linear_unit=args.swiglu or args.situ_glu,
         )
     )
 
@@ -761,7 +797,7 @@ def _run_moe_perf(
                 )
             router_bias_finalize_ms = _time_router_bias_finalization(config, layers)
             _verify_router_bias_pointers(layers, router_bias_pointers)
-            if iteration == 0 and config.use_situ_glu:
+            if iteration == 0 and config.activation_func is situlu:
                 _verify_situ_glu_fused_backend(layers)
             paged_stash_overflow, paged_stash_host_spill = _check_paged_stash_status(
                 paged_stash_enabled
@@ -791,7 +827,7 @@ def _run_moe_perf(
                     f"[moe_perf] iter={iteration} measured={iteration >= measurement_start} "
                     f"forward_ms={forward_ms:.3f} backward_ms={backward_ms:.3f} "
                     f"router_bias_finalize_ms={router_bias_finalize_ms:.3f} "
-                    f"router_bias_update_method={config.moe_router_bias_update_method} "
+                    f"router_bias_update_method={_router_bias_update_method(config)} "
                     f"throughput_tflops_per_gpu={throughput:.1f} "
                     f"full_iter_cuda_graph={graph_wrapper is not None} "
                     f"paged_stash={paged_stash_enabled} "
@@ -811,20 +847,18 @@ def _run_moe_perf(
         end_to_end_ms = iteration_ms + router_bias_finalize_ms
         throughput = flops_per_iteration / ((iteration_ms / 1000.0) * 10**12 * args.world_size)
         print(
-            "[moe_perf] summary "
-            f"layers={len(layers)} "
-            f"layer_numbers={[spec.layer_number for spec in layer_specs]} "
-            f"forward_ms_mean={forward_ms:.3f} "
-            f"forward_ms_stdev={statistics.pstdev(forward_timings) if len(forward_timings) > 1 else 0.0:.3f} "
-            f"backward_ms_mean={backward_ms:.3f} "
-            f"backward_ms_stdev={statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0:.3f} "
-            f"router_bias_finalize_ms_mean={router_bias_finalize_ms:.3f} "
-            f"router_bias_finalize_ms_stdev={statistics.pstdev(router_bias_finalize_timings) if len(router_bias_finalize_timings) > 1 else 0.0:.3f} "
-            f"router_bias_update_method={config.moe_router_bias_update_method} "
-            f"end_to_end_ms_mean={end_to_end_ms:.3f} "
-            f"throughput_tflops_per_gpu={throughput:.1f} "
-            f"flops_per_iteration={flops_per_iteration:.6e} "
-            f"max_allocated_gib_mean={statistics.mean(max_allocated) / (1024 ** 3):.3f}",
+            f"[moe_perf] summary layers={len(layers)}"
+            f" layer_numbers={[spec.layer_number for spec in layer_specs]}"
+            f" forward_ms_mean={forward_ms:.3f}"
+            f" forward_ms_stdev={statistics.pstdev(forward_timings) if len(forward_timings) > 1 else 0.0:.3f}"
+            f" backward_ms_mean={backward_ms:.3f}"
+            f" backward_ms_stdev={statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0:.3f}"
+            f" router_bias_finalize_ms_mean={router_bias_finalize_ms:.3f}"
+            f" router_bias_finalize_ms_stdev={statistics.pstdev(router_bias_finalize_timings) if len(router_bias_finalize_timings) > 1 else 0.0:.3f}"
+            f" router_bias_update_method={_router_bias_update_method(config)}"
+            f" end_to_end_ms_mean={end_to_end_ms:.3f} throughput_tflops_per_gpu={throughput:.1f}"
+            f" flops_per_iteration={flops_per_iteration:.6e}"
+            f" max_allocated_gib_mean={statistics.mean(max_allocated) / (1024 ** 3):.3f}",
             flush=True,
         )
 
@@ -867,11 +901,10 @@ def main() -> None:
             f"count={len(layer_specs)} "
             f"layer_numbers={[spec.layer_number for spec in layer_specs]} "
             f"force_load_balancing={config.moe_router_force_load_balancing} "
-            f"router_bias_update_method={config.moe_router_bias_update_method} "
+            f"router_bias_update_method={_router_bias_update_method(config)} "
             f"qb_num_bins={config.moe_router_qb_num_bins} "
             f"latent_up_rmsnorm={config.moe_latent_up_projection_rmsnorm} "
-            f"situ_glu={config.use_situ_glu} "
-            f"situ_glu_impl={config.situ_glu_impl}"
+            f"situ_glu={config.activation_func is situlu}"
         )
     layers = _build_moe_layers(layer_specs, config)
     _ensure_main_grad_buffers(layers)
