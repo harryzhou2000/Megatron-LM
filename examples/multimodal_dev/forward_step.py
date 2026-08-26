@@ -209,6 +209,10 @@ def pack_or_pad_batch(
             input_ids_list, labels_list, loss_mask_list = [], [], []
             pixel_values_list, image_grid_thw_list = [], []
             seqlens_list, seqlens_padded_list = [], []
+            real_vision_samples = [
+                sample for sample in batch if bool(sample.get("has_real_vision", True))
+            ]
+            vision_samples = real_vision_samples or [batch[0]]
 
             for sample in batch:
                 seqlen = sample["input_ids"].shape[0]
@@ -221,6 +225,8 @@ def pack_or_pad_batch(
                 loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
+
+            for sample in vision_samples:
                 pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
@@ -282,6 +288,11 @@ def pack_or_pad_batch(
         assert batch is not None, "source TP rank must provide a batch"
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         target_seqlens = min(max_seqlens, seq_length)
+        if max_seqlens > target_seqlens:
+            raise ValueError(
+                "Cannot pad BSHD batch because a sample exceeds the configured maximum: "
+                f"max_sample_length={max_seqlens}, seq_length={seq_length}"
+            )
         # Round target seqlen up to the parallelism alignment factor so the
         # batched tensor is divisible for CP (+SP) splitting downstream.
         if divisible_by > 1:
@@ -301,6 +312,10 @@ def pack_or_pad_batch(
             sample["loss_mask"] = F.pad(
                 sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
             )
+        real_vision_samples = [
+            sample for sample in batch if bool(sample.get("has_real_vision", True))
+        ]
+        vision_samples = real_vision_samples or [batch[0]]
 
         padded_batch["input_ids"] = torch.concat(
             [x["input_ids"].unsqueeze(0) for x in batch], dim=0
@@ -314,8 +329,12 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
-        padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+        padded_batch["pixel_values"] = torch.concat(
+            [sample["pixel_values"] for sample in vision_samples]
+        )
+        padded_batch["image_grid_thw"] = torch.concat(
+            [sample["image_grid_thw"] for sample in vision_samples]
+        )
 
     return broadcast_data_batch(padded_batch, device=device)
 
