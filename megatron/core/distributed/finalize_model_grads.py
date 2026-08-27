@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.extensions.transformer_engine import mark_qb_bin_bounds_validated
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -414,6 +415,8 @@ def _update_router_expert_bias_with_quantile(
     ):
         bias.copy_(next_bias)
         bounds.copy_(next_bounds)
+        if mark_qb_bin_bounds_validated is not None and bounds.is_cuda:
+            mark_qb_bin_bounds_validated(bounds)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
